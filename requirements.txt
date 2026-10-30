@@ -6,3 +6,5 @@ matplotlib
 pillow
 huggingface_hub
 ipykernel
+transformers
+nbconvert
