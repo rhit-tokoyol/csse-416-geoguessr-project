@@ -10,7 +10,7 @@
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate CSSE416
 
-cd /home/kennym1/CSSE416/
+cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs output
 
 echo "node: $(hostname) | CPUs: $SLURM_CPUS_PER_TASK"
