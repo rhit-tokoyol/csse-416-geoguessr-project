@@ -15,9 +15,10 @@ the left). We use it two ways:
 
    `w` is tuned on a validation split (w = 0 reproduces the plain model).
 
-IMPORTANT: never use horizontal-flip augmentation on the images. Flipping a
-street-view image turns a left-driving scene into a right-driving one and
-would teach the model the wrong label.
+Mirroring: a mirrored left-driving scene looks like a right-driving one. The
+side detector exploits this (see MultiTaskHead): it compares each image's CLIP
+features with the features of its mirror image. Never add plain random
+horizontal-flip augmentation without also swapping the side label.
 """
 
 import numpy as np
@@ -65,22 +66,37 @@ def cell_left_fraction(frame, num_cells, cell_col="cell_label", side_col="side_l
 
 
 class MultiTaskHead(nn.Module):
-    """Shared hidden layer -> (cell logits, driving-side logit)."""
+    """(features, mirrored features) -> (cell logits, driving-side logit).
 
-    def __init__(self, n_cells, in_dim, hidden=1024, p=0.3):
+    The side logit is mirror-antisymmetric:
+
+        side(x) = g(f(x)) - g(f(mirror(x)))
+
+    so mirroring an image exactly flips the prediction (left <-> right). This
+    forces the side detector to rely on left/right asymmetry in the scene
+    (which side traffic, shoulders and signs are on) rather than on "this looks
+    like Japan", which the cell classifier already knows. A scene with no
+    asymmetric cues gives a logit near 0 (P = 0.5), and fusion then leaves the
+    cell probabilities alone. It also means every training image is
+    effectively used twice: once as-is and once mirrored with the opposite label.
+    """
+
+    def __init__(self, n_cells, in_dim, hidden=1024, p=0.3, side_hidden=256):
         super().__init__()
         self.trunk = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(), nn.Dropout(p))
         self.cell_out = nn.Linear(hidden, n_cells)
-        self.side_out = nn.Linear(hidden, 1)
+        self.side_net = nn.Sequential(nn.Linear(in_dim, side_hidden), nn.ReLU(), nn.Dropout(p),
+                                      nn.Linear(side_hidden, 1))
 
-    def forward(self, x):
-        h = self.trunk(x)
-        return self.cell_out(h), self.side_out(h).squeeze(-1)
+    def forward(self, x, x_mirror):
+        cell_logits = self.cell_out(self.trunk(x))
+        side_logit = (self.side_net(x) - self.side_net(x_mirror)).squeeze(-1)
+        return cell_logits, side_logit
 
 
 def train_multitask(head, train_loader, test_loader, optimizer, epochs, device,
                     side_weight=0.5):
-    """Trains on loaders yielding (features, cell_label, side_label).
+    """Trains on loaders yielding (features, mirrored features, cell_label, side_label).
 
     loss = CE(cell) + side_weight * BCE(side)
     Returns history dict and the final state_dict.
@@ -92,9 +108,9 @@ def train_multitask(head, train_loader, test_loader, optimizer, epochs, device,
         head.train(train)
         tot_loss = correct = side_correct = n = 0
         with torch.set_grad_enabled(train):
-            for x, y, s in loader:
-                x, y, s = x.to(device), y.to(device), s.to(device).float()
-                cell_logits, side_logit = head(x)
+            for x, xm, y, s in loader:
+                x, xm, y, s = x.to(device), xm.to(device), y.to(device), s.to(device).float()
+                cell_logits, side_logit = head(x, xm)
                 loss = F.cross_entropy(cell_logits, y) \
                     + side_weight * F.binary_cross_entropy_with_logits(side_logit, s)
                 if train:
@@ -123,8 +139,8 @@ def predict(head, loader, device):
     """Returns (cell log-probs [N, C], P(left) [N], true cells [N], true sides [N]) as numpy."""
     head.eval()
     logps, pls, ys, ss = [], [], [], []
-    for x, y, s in loader:
-        cell_logits, side_logit = head(x.to(device))
+    for x, xm, y, s in loader:
+        cell_logits, side_logit = head(x.to(device), xm.to(device))
         logps.append(F.log_softmax(cell_logits, dim=1).cpu())
         pls.append(torch.sigmoid(side_logit).cpu())
         ys.append(y)
