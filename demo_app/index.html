@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Where Is This? · CSSE 416 GeoGuessr</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;800&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  /* Layout: input column (screenshot + crop) beside output column (map + guesses); stacks on phones. */
+  :root {
+    --bg: #f3f5f2; --panel: #ffffff; --fg: #18211c; --muted: #5b6a61; --line: #d6ddd7;
+    --accent: #1f7a4d; --accent-soft: #d9efe3; --pin: #c2410c; --warn: #9a6700; --bad: #b42318;
+    --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+    --body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111613; --panel: #1a211d; --fg: #e6ece8; --muted: #9aa9a0; --line: #2c3731;
+            --accent: #4cc08a; --accent-soft: #1d3a2c; --pin: #fb923c; --warn: #e3b341; --bad: #f97066;
+            color-scheme: dark; }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 var(--body); }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 24px max(16px, env(safe-area-inset-left)) 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; margin-bottom: 20px; }
+  h1 { font: 800 clamp(1.6rem, 3vw, 2.2rem)/1.1 var(--display); margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+  header p { margin: 0; color: var(--muted); max-width: 60ch; }
+  .models { font: 400 .8rem var(--mono); color: var(--muted); }
+  .grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 20px; align-items: start; }
+  @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; min-width: 0; }
+  h2 { font: 600 .78rem var(--display); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; }
+
+  /* Input */
+  .drop { position: relative; border: 2px dashed var(--line); border-radius: var(--radius); min-height: 240px;
+          display: grid; place-items: center; text-align: center; padding: 16px; cursor: pointer; transition: border-color .15s, background .15s; }
+  .drop:hover, .drop.over, .drop:focus-visible { border-color: var(--accent); background: var(--accent-soft); outline: none; }
+  .drop strong { display: block; font: 600 1.05rem var(--display); }
+  .drop span { color: var(--muted); font-size: .92rem; }
+  kbd { font: .8rem var(--mono); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; }
+  .stage { position: relative; user-select: none; touch-action: none; cursor: crosshair; line-height: 0; }
+  .stage img { width: 100%; height: auto; border-radius: 6px; display: block; }
+  .sel { position: absolute; border: 2px solid var(--accent); box-shadow: 0 0 0 9999px rgba(0,0,0,.45); pointer-events: none; border-radius: 2px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+  .hint { color: var(--muted); font-size: .88rem; margin: 10px 0 0; }
+  button { font: 600 .95rem var(--body); border-radius: 8px; padding: 9px 16px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  @media (prefers-color-scheme: dark) { button.primary { color: #08140e; } }
+  button:disabled { opacity: .5; cursor: default; }
+  .status { font-size: .9rem; color: var(--muted); min-height: 1.5em; }
+  .status.error { color: var(--bad); }
+
+  /* Output */
+  #map { height: 380px; border-radius: 8px; border: 1px solid var(--line); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-top: 16px; }
+  ol.guesses { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  ol.guesses li.empty { display: block; }
+  ol.guesses li:not(.empty) { display: grid; grid-template-columns: 1.6rem minmax(0, 1fr) auto; gap: 2px 10px; align-items: center; }
+  .rank { font: 600 .8rem var(--mono); width: 1.6rem; height: 1.6rem; border-radius: 50%; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); }
+  li:first-child .rank { background: var(--pin); color: #fff; }
+  .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pct { font: 600 .9rem var(--mono); font-variant-numeric: tabular-nums; }
+  .coords { grid-column: 2 / 4; font: .78rem var(--mono); color: var(--muted); }
+  .bar { grid-column: 2 / 4; height: 5px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+  li:first-child .bar i { background: var(--pin); }
+  .side { display: grid; gap: 6px; }
+  .side .track { position: relative; height: 10px; border-radius: 5px; background: linear-gradient(90deg, var(--accent-soft), var(--line)); }
+  .side .dot { position: absolute; top: 50%; width: 16px; height: 16px; margin: -8px 0 0 -8px; border-radius: 50%; background: var(--accent); border: 2px solid var(--panel); }
+  .side .ends { display: flex; justify-content: space-between; font: .78rem var(--mono); color: var(--muted); }
+  .side p, .note { margin: 0; font-size: .92rem; }
+  .note { color: var(--muted); margin-top: 10px; }
+  .score { display: flex; flex-wrap: wrap; gap: 4px 24px; align-items: baseline; }
+  .score b { font: 800 2rem var(--display); font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); font-size: .92rem; margin: 0; }
+  .leaflet-container { font: inherit; }
+  .pinlabel { background: var(--pin); color: #fff; border-radius: 50%; width: 26px !important; height: 26px !important; margin: -13px 0 0 -13px !important;
+              display: grid; place-items: center; font: 600 13px var(--mono); border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.4); }
+  .pinlabel.minor { background: var(--accent); width: 20px !important; height: 20px !important; margin: -10px 0 0 -10px !important; font-size: 11px; }
+  .truepin { background: #111; color: #fff; border-radius: 4px; padding: 0 5px; font: 600 11px var(--mono); white-space: nowrap; border: 2px solid #fff; width: auto !important; height: auto !important; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Where is this?</h1>
+      <p>Drop in a GeoGuessr screenshot and see where our models would guess.</p>
+    </div>
+    <div class="models" id="models">Loading models…</div>
+  </header>
+
+  <div class="grid">
+    <section class="panel" aria-labelledby="in-h">
+      <h2 id="in-h">Screenshot</h2>
+      <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose, drop or paste a screenshot">
+        <div><strong>Paste a screenshot</strong><span>Press <kbd>Ctrl</kbd>+<kbd>V</kbd>, drop an image here, or click to choose a file.</span></div>
+      </div>
+      <div class="stage" id="stage" hidden>
+        <img id="preview" alt="Uploaded screenshot" draggable="false">
+        <div class="sel" id="sel" hidden></div>
+      </div>
+      <input type="file" id="file" accept="image/*" hidden>
+      <p class="hint" id="cropHint" hidden>Drag over the street view to leave out the minimap, compass and buttons. The models never saw those in training.</p>
+      <div class="row">
+        <button class="primary" id="go" disabled>Guess location</button>
+        <button id="clearCrop" hidden>Use whole image</button>
+        <button id="another" hidden>New screenshot</button>
+      </div>
+      <p class="status" id="status" role="status"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="out-h">
+      <h2 id="out-h">Guesses</h2>
+      <div id="map" role="region" aria-label="Map of guesses"></div>
+      <p class="note" id="mapNote">After a guess, click the map where the screenshot was really taken to see the GeoGuessr score.</p>
+      <div class="cards">
+        <div>
+          <h2>CLIP · map cell</h2>
+          <ol class="guesses" id="clipList"><li class="empty">No guess yet.</li></ol>
+          <p class="note" id="plainNote" hidden></p>
+        </div>
+        <div>
+          <h2>ResNet · country</h2>
+          <ol class="guesses" id="resnetList"><li class="empty">No guess yet.</li></ol>
+        </div>
+        <div class="side">
+          <h2>Driving side</h2>
+          <div class="track" aria-hidden="true"><div class="dot" id="sideDot" style="left:50%"></div></div>
+          <div class="ends"><span>Left</span><span>Right</span></div>
+          <p id="sideText" class="empty">No guess yet.</p>
+        </div>
+        <div>
+          <h2>Score</h2>
+          <div class="score"><b id="scoreNum">–</b><span id="scoreText" class="empty">Click the true location on the map.</span></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const regionName = (() => {
+  let dn = null;
+  try { dn = new Intl.DisplayNames(["en"], { type: "region" }); } catch (e) {}
+  return (code) => { try { return (dn && code && dn.of(code)) || code || "Unknown"; } catch (e) { return code; } };
+})();
+const flag = (code) => /^[A-Z]{2}$/.test(code || "") ? String.fromCodePoint(...[...code].map(c => 0x1F1A5 + c.charCodeAt(0))) : "";
+const pct = (p) => (p * 100 >= 10 ? (p * 100).toFixed(0) : (p * 100).toFixed(1)) + "%";
+const fmtCoord = (lat, lon) => `${Math.abs(lat).toFixed(2)}°${lat >= 0 ? "N" : "S"}, ${Math.abs(lon).toFixed(2)}°${lon >= 0 ? "E" : "W"}`;
+
+// ---------- map ----------
+const map = L.map("map", { worldCopyJump: true }).setView([20, 0], 2);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 12, attribution: "&copy; OpenStreetMap contributors",
+}).addTo(map);
+const layer = L.layerGroup().addTo(map);
+let topGuess = null, trueMarker = null, trueLine = null;
+
+function haversineKm(a, b) {
+  const R = 6371, rad = Math.PI / 180;
+  const dLat = (b[0] - a[0]) * rad, dLon = (b[1] - a[1]) * rad;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a[0] * rad) * Math.cos(b[0] * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+map.on("click", (e) => {
+  if (!topGuess) return;
+  const t = [e.latlng.lat, ((e.latlng.lng + 540) % 360) - 180];
+  if (trueMarker) map.removeLayer(trueMarker);
+  if (trueLine) map.removeLayer(trueLine);
+  trueMarker = L.marker(t, { icon: L.divIcon({ className: "truepin", html: "TRUE" }) }).addTo(map);
+  trueLine = L.polyline([t, topGuess], { color: "#888", dashArray: "6 6", weight: 2 }).addTo(map);
+  const d = haversineKm(t, topGuess);
+  const score = Math.round(5000 * Math.exp(-d / 1492.7));   // same formula as the notebook's Geoscore
+  $("scoreNum").textContent = score.toLocaleString();
+  $("scoreText").className = "";
+  $("scoreText").textContent = `points · top CLIP guess is ${d < 10 ? d.toFixed(1) : Math.round(d).toLocaleString()} km away`;
+});
+
+// ---------- input ----------
+let imageFile = null, crop = null;
+const drop = $("drop"), stage = $("stage"), preview = $("preview"), sel = $("sel");
+
+function setStatus(text, error = false) { $("status").textContent = text; $("status").className = "status" + (error ? " error" : ""); }
+function useFile(file) {
+  if (!file || !file.type.startsWith("image/")) { setStatus("That isn't an image. Paste or choose a PNG or JPEG screenshot.", true); return; }
+  imageFile = file; crop = null; sel.hidden = true;
+  preview.src = URL.createObjectURL(file);
+  drop.hidden = true; stage.hidden = false; $("cropHint").hidden = false;
+  $("another").hidden = false; $("clearCrop").hidden = true; $("go").disabled = false;
+  setStatus("");
+}
+drop.addEventListener("click", () => $("file").click());
+drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $("file").click(); } });
+$("file").addEventListener("change", (e) => useFile(e.target.files[0]));
+["dragenter", "dragover"].forEach(t => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach(t => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", (e) => useFile(e.dataTransfer.files[0]));
+document.addEventListener("paste", (e) => {
+  const item = [...(e.clipboardData?.items || [])].find(i => i.type.startsWith("image/"));
+  if (item) useFile(item.getAsFile());
+});
+$("another").addEventListener("click", () => {
+  imageFile = null; crop = null; stage.hidden = true; drop.hidden = false; $("cropHint").hidden = true;
+  $("another").hidden = true; $("clearCrop").hidden = true; $("go").disabled = true; $("file").value = ""; setStatus("");
+});
+$("clearCrop").addEventListener("click", () => { crop = null; sel.hidden = true; $("clearCrop").hidden = true; });
+
+// drag to crop (fractions of the displayed image)
+let dragStart = null;
+const frac = (e) => { const r = preview.getBoundingClientRect();
+  return [Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1), Math.min(Math.max((e.clientY - r.top) / r.height, 0), 1)]; };
+function drawSel(a, b) {
+  const [x0, x1] = [Math.min(a[0], b[0]), Math.max(a[0], b[0])], [y0, y1] = [Math.min(a[1], b[1]), Math.max(a[1], b[1])];
+  Object.assign(sel.style, { left: x0 * 100 + "%", top: y0 * 100 + "%", width: (x1 - x0) * 100 + "%", height: (y1 - y0) * 100 + "%" });
+  sel.hidden = false; return [x0, y0, x1, y1];
+}
+// The crop always equals the box on screen, even if the mouse is released outside the window.
+function updateCrop(box, final) {
+  const big = box[2] - box[0] >= 0.05 && box[3] - box[1] >= 0.05;
+  crop = big ? box : null;
+  $("clearCrop").hidden = !big;
+  if (final && !big) sel.hidden = true;
+}
+stage.addEventListener("dragstart", (e) => e.preventDefault());
+stage.addEventListener("pointerdown", (e) => { e.preventDefault(); dragStart = frac(e); try { stage.setPointerCapture(e.pointerId); } catch (_) {} });
+stage.addEventListener("pointermove", (e) => { if (dragStart) updateCrop(drawSel(dragStart, frac(e)), false); });
+const endDrag = (e) => { if (!dragStart) return; updateCrop(drawSel(dragStart, frac(e)), true); dragStart = null; };
+stage.addEventListener("pointerup", endDrag);
+stage.addEventListener("pointercancel", endDrag);
+stage.addEventListener("lostpointercapture", endDrag);
+
+// ---------- predict ----------
+function renderList(el, items) {
+  el.replaceChildren(...items.map((g, i) => {
+    const li = document.createElement("li");
+    const rank = document.createElement("span"); rank.className = "rank"; rank.textContent = i + 1;
+    const name = document.createElement("span"); name.className = "name";
+    name.textContent = `${flag(g.country)} ${regionName(g.country)}`.trim();
+    const p = document.createElement("span"); p.className = "pct"; p.textContent = pct(g.prob);
+    li.append(rank, name, p);
+    if (g.lat != null) { const c = document.createElement("span"); c.className = "coords"; c.textContent = `cell ${g.cell} · ${fmtCoord(g.lat, g.lon)}`; li.append(c); }
+    const bar = document.createElement("span"); bar.className = "bar";
+    const fill = document.createElement("i"); fill.style.width = Math.max(g.prob * 100, 1) + "%"; bar.append(fill); li.append(bar);
+    return li;
+  }));
+}
+function emptyList(el, text) { const li = document.createElement("li"); li.className = "empty"; li.textContent = text; el.replaceChildren(li); }
+
+$("go").addEventListener("click", async () => {
+  if (!imageFile) return;
+  const fd = new FormData(); fd.append("image", imageFile);
+  if (crop) ["x0", "y0", "x1", "y1"].forEach((k, i) => fd.append(k, crop[i]));
+  $("go").disabled = true; setStatus("Thinking… the first guess takes a few seconds while the models warm up.");
+  try {
+    const res = await fetch("/api/predict", { method: "POST", body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `The server answered ${res.status}.`);
+    show(data);
+    setStatus(`Guessed from a ${data.size[0]}×${data.size[1]} image${crop ? " (cropped)" : ""}.`);
+  } catch (err) {
+    setStatus(err.message.includes("fetch") ? "Can't reach the demo server. Is app.py still running?" : err.message, true);
+  } finally { $("go").disabled = false; }
+});
+
+function show(data) {
+  layer.clearLayers();
+  if (trueMarker) { map.removeLayer(trueMarker); trueMarker = null; }
+  if (trueLine) { map.removeLayer(trueLine); trueLine = null; }
+  $("scoreNum").textContent = "–"; $("scoreText").className = "empty"; $("scoreText").textContent = "Click the true location on the map.";
+
+  if (data.clip) {
+    const gs = data.clip.guesses;
+    renderList($("clipList"), gs);
+    gs.slice().reverse().forEach((g, ri) => {
+      const i = gs.length - 1 - ri;
+      L.marker([g.lat, g.lon], { icon: L.divIcon({ className: "pinlabel" + (i ? " minor" : ""), html: String(i + 1) }), zIndexOffset: i ? 0 : 1000 })
+        .bindTooltip(`${i + 1}. ${regionName(g.country)} · ${pct(g.prob)}`).addTo(layer);
+    });
+    topGuess = [gs[0].lat, gs[0].lon];
+    map.fitBounds(L.latLngBounds(gs.map(g => [g.lat, g.lon])).pad(0.6), { maxZoom: 6 });
+
+    const pl = data.clip.p_left_driving;
+    $("sideDot").style.left = ((1 - pl) * 100) + "%";
+    const sure = Math.max(pl, 1 - pl);
+    $("sideText").className = "";
+    $("sideText").textContent = sure < 0.6 ? "Can't tell which side traffic drives on from this view."
+      : `Drives on the ${pl > 0.5 ? "left" : "right"} · ${pct(sure)} sure`;
+
+    const plain = data.clip.plain_top;
+    if (plain && plain.cell !== gs[0].cell) {
+      $("plainNote").hidden = false;
+      $("plainNote").textContent = `Driving side changed the top guess. Without it: ${regionName(plain.country)}, cell ${plain.cell}.`;
+    } else { $("plainNote").hidden = true; }
+  } else {
+    emptyList($("clipList"), "CLIP model isn't loaded."); topGuess = null;
+  }
+  if (data.resnet) renderList($("resnetList"), data.resnet);
+  else emptyList($("resnetList"), "ResNet model isn't loaded. Export it with export_demo.py --resnet-head.");
+}
+
+fetch("/api/models").then(r => r.json()).then(m => {
+  const parts = [];
+  if (m.clip) parts.push(`CLIP: ${m.clip.cells.toLocaleString()} cells, driving-side weight ${m.clip.fusion_weight}`);
+  if (m.resnet) parts.push(`ResNet: ${m.resnet.countries} countries`);
+  $("models").textContent = parts.join(" · ") || "No models loaded";
+  if (!m.resnet) emptyList($("resnetList"), "ResNet model isn't loaded. Export it with export_demo.py --resnet-head.");
+}).catch(() => { $("models").textContent = "Can't reach the demo server."; });
+</script>
+</body>
+</html>

@@ -48,7 +48,7 @@ class ResNetCountry:
     def predict(self, image, k=5):
         x = self.transform(image.convert("RGB")).unsqueeze(0).to(self.device)
         probs = self.head(self.backbone(x)).softmax(1)[0].cpu()
-        p, i = probs.topk(k)
+        p, i = probs.topk(min(k, len(self.classes)))
         return [{"country": self.classes[j], "prob": float(q)} for q, j in zip(p, i)]
 
 
