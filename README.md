@@ -2,7 +2,7 @@
 
 This project guesses where a street-level photo was taken. It sorts each photo into one of 1,905 map areas (we call them cells) and guesses the center of the chosen cell. A guess is scored by how far it is from the true location, out of 5,000 points.
 
-Everything is in one notebook, main.ipynb. It loads the image list, runs every photo through a pretrained model called CLIP to turn it into a list of numbers, trains a small network on those numbers to pick the cell, and then tests it on photos it hasn't seen. The other files are extras: train.sbatch runs the notebook on a cluster, geo/ and extension/ are a local prediction server and a browser extension, and docs/ is the demo website.
+Everything for CLIP is in one notebook, main.ipynb. It loads the image list, runs every photo through a pretrained model called CLIP to turn it into a list of numbers, trains a small network on those numbers to pick the cell, and then tests it on photos it hasn't seen. 
 
 To install what it needs, use Python 3.11 and run:
 
