@@ -1,10 +1,4 @@
 [
-  {
-    "name": "Run 2: mirror driving side",
-    "dir": "model"
-  },
-  {
-    "name": "Run 12",
-    "dir": "model/run12"
-  }
+  {"name": "Run 2: mirror driving side", "dir": "model"},
+  {"name": "L/14 residual head", "dir": "model/l14"}
 ]
