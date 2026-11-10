@@ -19,22 +19,27 @@ from PIL import Image, UnidentifiedImageError
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import demo_predict  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from country_centers import CENTERS  # noqa: E402
 
 MODEL_DIR = Path(os.environ.get("DEMO_MODELS", ROOT / "demo_models"))
 DEVICE = "cuda" if os.environ.get("DEMO_GPU") else "cpu"
 
 
-def load(cls, filename):
-    path = MODEL_DIR / filename
-    if not path.exists():
-        print(f"[demo] {path} not found; skipping {cls.__name__}")
-        return None
-    print(f"[demo] loading {path} ...")
-    return cls(path, device=DEVICE)
+def load(cls, *filenames):
+    """Load the first of `filenames` that exists in MODEL_DIR; None if none do."""
+    for filename in filenames:
+        path = MODEL_DIR / filename
+        if path.exists():
+            print(f"[demo] loading {path} ...")
+            return cls(path, device=DEVICE)
+    print(f"[demo] none of {', '.join(filenames)} found in {MODEL_DIR}; skipping {cls.__name__}")
+    return None
 
 
 clip_model = load(demo_predict.ClipCell, "clip_cell.pt")
-resnet_model = load(demo_predict.ResNetCountry, "resnet_country.pt")
+# train_model_sample_1.pt is the raw head saved by resnet_model.ipynb
+resnet_model = load(demo_predict.ResNetCountry, "resnet_country.pt", "train_model_sample_1.pt")
 if not (clip_model or resnet_model):
     sys.exit(f"No models in {MODEL_DIR}. Run export_demo.py and download demo_models/ first.")
 
@@ -81,13 +86,24 @@ def predict():
     except UnidentifiedImageError:
         return jsonify(error="That file isn't an image this demo can read. Try a PNG or JPEG."), 400
     image = crop_box(image)
-    out = {"size": list(image.size)}
-    if clip_model is not None:
+    choice = request.form.get("model", "clip")
+    out = {"size": list(image.size), "model": choice}
+    if choice == "clip":
+        if clip_model is None:
+            return jsonify(error="The CLIP model isn't loaded on the server."), 400
         out["clip"] = clip_model.predict(image, k=5)
         plain = clip_model.predict(image, k=1, use_driving_side=False)["guesses"][0]
         out["clip"]["plain_top"] = plain
-    if resnet_model is not None:
-        out["resnet"] = resnet_model.predict(image, k=5)
+    elif choice == "resnet":
+        if resnet_model is None:
+            return jsonify(error="The ResNet model isn't loaded on the server."), 400
+        guesses = []
+        for g in resnet_model.predict(image, k=3):
+            lat, lon = CENTERS.get(g["country"], (None, None))
+            guesses.append({**g, "lat": lat, "lon": lon})
+        out["resnet"] = guesses
+    else:
+        return jsonify(error=f"Unknown model '{choice}'."), 400
     return jsonify(out)
 
 

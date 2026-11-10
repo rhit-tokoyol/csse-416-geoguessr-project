@@ -54,6 +54,12 @@
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   @media (prefers-color-scheme: dark) { button.primary { color: #08140e; } }
   button:disabled { opacity: .5; cursor: default; }
+  .pick { display: grid; gap: 4px; margin: 0 0 14px; }
+  .pick span { font: 600 .78rem var(--display); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  select { font: 600 .95rem var(--body); width: 100%; border-radius: 8px; padding: 9px 12px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); cursor: pointer; }
+  select:hover { border-color: var(--accent); }
+  select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  select:disabled { opacity: .5; cursor: default; }
   .status { font-size: .9rem; color: var(--muted); min-height: 1.5em; }
   .status.error { color: var(--bad); }
 
@@ -101,6 +107,12 @@
   <div class="grid">
     <section class="panel" aria-labelledby="in-h">
       <h2 id="in-h">Screenshot</h2>
+      <label class="pick" for="model"><span>Model</span>
+        <select id="model">
+          <option value="clip">CLIP · map cell</option>
+          <option value="resnet">ResNet · country</option>
+        </select>
+      </label>
       <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose, drop or paste a screenshot">
         <div><strong>Paste a screenshot</strong><span>Press <kbd>Ctrl</kbd>+<kbd>V</kbd>, drop an image here, or click to choose a file.</span></div>
       </div>
@@ -123,16 +135,17 @@
       <div id="map" role="region" aria-label="Map of guesses"></div>
       <p class="note" id="mapNote">After a guess, click the map where the screenshot was really taken to see the GeoGuessr score.</p>
       <div class="cards">
-        <div>
+        <div data-for="clip">
           <h2>CLIP · map cell</h2>
           <ol class="guesses" id="clipList"><li class="empty">No guess yet.</li></ol>
           <p class="note" id="plainNote" hidden></p>
         </div>
-        <div>
-          <h2>ResNet · country</h2>
+        <div data-for="resnet" hidden>
+          <h2>ResNet · top 3 countries</h2>
           <ol class="guesses" id="resnetList"><li class="empty">No guess yet.</li></ol>
+          <p class="note">Pins sit at the middle of each country, not where the photo was taken.</p>
         </div>
-        <div class="side">
+        <div class="side" data-for="clip">
           <h2>Driving side</h2>
           <div class="track" aria-hidden="true"><div class="dot" id="sideDot" style="left:50%"></div></div>
           <div class="ends"><span>Left</span><span>Right</span></div>
@@ -165,7 +178,8 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 12, attribution: "&copy; OpenStreetMap contributors",
 }).addTo(map);
 const layer = L.layerGroup().addTo(map);
-let topGuess = null, trueMarker = null, trueLine = null;
+let topGuess = null, trueMarker = null, trueLine = null, shownModel = "clip";
+const MODEL_NAME = { clip: "CLIP", resnet: "ResNet" };
 
 function haversineKm(a, b) {
   const R = 6371, rad = Math.PI / 180;
@@ -184,7 +198,8 @@ map.on("click", (e) => {
   const score = Math.round(5000 * Math.exp(-d / 1492.7));   // same formula as the notebook's Geoscore
   $("scoreNum").textContent = score.toLocaleString();
   $("scoreText").className = "";
-  $("scoreText").textContent = `points · top CLIP guess is ${d < 10 ? d.toFixed(1) : Math.round(d).toLocaleString()} km away`;
+  const what = shownModel === "resnet" ? "top ResNet guess (country centre)" : "top CLIP guess";
+  $("scoreText").textContent = `points · ${what} is ${d < 10 ? d.toFixed(1) : Math.round(d).toLocaleString()} km away`;
 });
 
 // ---------- input ----------
@@ -249,7 +264,10 @@ function renderList(el, items) {
     name.textContent = `${flag(g.country)} ${regionName(g.country)}`.trim();
     const p = document.createElement("span"); p.className = "pct"; p.textContent = pct(g.prob);
     li.append(rank, name, p);
-    if (g.lat != null) { const c = document.createElement("span"); c.className = "coords"; c.textContent = `cell ${g.cell} · ${fmtCoord(g.lat, g.lon)}`; li.append(c); }
+    if (g.lat != null) {
+      const c = document.createElement("span"); c.className = "coords";
+      c.textContent = `${g.cell != null ? `cell ${g.cell}` : "country centre"} · ${fmtCoord(g.lat, g.lon)}`; li.append(c);
+    }
     const bar = document.createElement("span"); bar.className = "bar";
     const fill = document.createElement("i"); fill.style.width = Math.max(g.prob * 100, 1) + "%"; bar.append(fill); li.append(bar);
     return li;
@@ -259,9 +277,10 @@ function emptyList(el, text) { const li = document.createElement("li"); li.class
 
 $("go").addEventListener("click", async () => {
   if (!imageFile) return;
-  const fd = new FormData(); fd.append("image", imageFile);
+  const fd = new FormData(); fd.append("image", imageFile); fd.append("model", modelSel.value);
   if (crop) ["x0", "y0", "x1", "y1"].forEach((k, i) => fd.append(k, crop[i]));
-  $("go").disabled = true; setStatus("Thinking… the first guess takes a few seconds while the models warm up.");
+  $("go").disabled = true; modelSel.disabled = true;
+  setStatus("Thinking… the first guess takes a few seconds while the model warms up.");
   try {
     const res = await fetch("/api/predict", { method: "POST", body: fd });
     const data = await res.json().catch(() => ({}));
@@ -270,14 +289,44 @@ $("go").addEventListener("click", async () => {
     setStatus(`Guessed from a ${data.size[0]}×${data.size[1]} image${crop ? " (cropped)" : ""}.`);
   } catch (err) {
     setStatus(err.message.includes("fetch") ? "Can't reach the demo server. Is app.py still running?" : err.message, true);
-  } finally { $("go").disabled = false; }
+  } finally { $("go").disabled = false; modelSel.disabled = false; }
 });
 
-function show(data) {
-  layer.clearLayers();
+// ---------- model dropdown ----------
+const modelSel = $("model");
+function applyModel() {   // show only the result cards that belong to the chosen model
+  document.querySelectorAll("[data-for]").forEach(el => { el.hidden = el.dataset.for !== modelSel.value; });
+}
+function resetResults() {
+  layer.clearLayers(); topGuess = null;
   if (trueMarker) { map.removeLayer(trueMarker); trueMarker = null; }
   if (trueLine) { map.removeLayer(trueLine); trueLine = null; }
+  emptyList($("clipList"), "No guess yet."); emptyList($("resnetList"), "No guess yet.");
+  $("plainNote").hidden = true;
+  $("sideDot").style.left = "50%"; $("sideText").className = "empty"; $("sideText").textContent = "No guess yet.";
   $("scoreNum").textContent = "–"; $("scoreText").className = "empty"; $("scoreText").textContent = "Click the true location on the map.";
+}
+modelSel.addEventListener("change", () => { resetResults(); applyModel(); setStatus(""); map.setView([20, 0], 2); });
+applyModel();
+
+function show(data) {
+  resetResults();
+  shownModel = data.model || modelSel.value;
+
+  if (data.resnet) {
+    const gs = data.resnet;
+    renderList($("resnetList"), gs);
+    const placed = gs.map((g, i) => ({ g, i })).filter(({ g }) => g.lat != null);
+    placed.slice().reverse().forEach(({ g, i }) => {
+      L.marker([g.lat, g.lon], { icon: L.divIcon({ className: "pinlabel" + (i ? " minor" : ""), html: String(i + 1) }), zIndexOffset: i ? 0 : 1000 })
+        .bindTooltip(`${i + 1}. ${regionName(g.country)} · ${pct(g.prob)}`).addTo(layer);
+    });
+    if (placed.length) {
+      topGuess = gs[0].lat != null ? [gs[0].lat, gs[0].lon] : null;
+      map.fitBounds(L.latLngBounds(placed.map(({ g }) => [g.lat, g.lon])).pad(0.6), { maxZoom: 5 });
+    }
+    return;
+  }
 
   if (data.clip) {
     const gs = data.clip.guesses;
@@ -302,11 +351,7 @@ function show(data) {
       $("plainNote").hidden = false;
       $("plainNote").textContent = `Driving side changed the top guess. Without it: ${regionName(plain.country)}, cell ${plain.cell}.`;
     } else { $("plainNote").hidden = true; }
-  } else {
-    emptyList($("clipList"), "CLIP model isn't loaded."); topGuess = null;
   }
-  if (data.resnet) renderList($("resnetList"), data.resnet);
-  else emptyList($("resnetList"), "ResNet model isn't loaded. Export it with export_demo.py --resnet-head.");
 }
 
 fetch("/api/models").then(r => r.json()).then(m => {
@@ -314,7 +359,14 @@ fetch("/api/models").then(r => r.json()).then(m => {
   if (m.clip) parts.push(`CLIP: ${m.clip.cells.toLocaleString()} cells, driving-side weight ${m.clip.fusion_weight}`);
   if (m.resnet) parts.push(`ResNet: ${m.resnet.countries} countries`);
   $("models").textContent = parts.join(" · ") || "No models loaded";
-  if (!m.resnet) emptyList($("resnetList"), "ResNet model isn't loaded. Export it with export_demo.py --resnet-head.");
+  // Grey out any model the server didn't load, and start on one that is there.
+  for (const opt of modelSel.options) {
+    if (!m[opt.value]) { opt.disabled = true; opt.textContent += " (not loaded)"; }
+  }
+  if (modelSel.selectedOptions[0]?.disabled) {
+    const first = [...modelSel.options].find(o => !o.disabled);
+    if (first) { modelSel.value = first.value; resetResults(); applyModel(); }
+  }
 }).catch(() => { $("models").textContent = "Can't reach the demo server."; });
 </script>
 </body>

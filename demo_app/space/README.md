@@ -19,7 +19,10 @@ see where our models would guess.
   traffic drives on by comparing the image with its mirror image, and that
   adjusts the cell guess.
 - **ResNet model** (when included): frozen ResNet-101 features with a trained
-  head that picks a country.
+  residual MLP head that picks a country. The page shows the top 3 countries
+  with their confidence, pinned at the middle of each country.
+
+Pick the model from the dropdown above the screenshot box.
 
 Trained on street-level images from the
 [OpenStreetView-5M](https://huggingface.co/datasets/osv5m/osv5m) dataset.

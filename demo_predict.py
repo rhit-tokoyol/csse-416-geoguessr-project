@@ -28,24 +28,91 @@ def make_transform(t):
     return T.Compose(steps + [T.ToTensor(), T.Normalize(t["mean"], t["std"])])
 
 
+# Country order the notebook's LabelEncoder produced (sorted unique_country, 222 codes).
+# Raw checkpoints from resnet_model.ipynb are only a state_dict, so the labels live here.
+RESNET_CLASSES = [
+    "AD", "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AR", "AT", "AU", "AW", "AX", "AZ", "BA",
+    "BB", "BD", "BE", "BF", "BG", "BH", "BI", "BJ", "BM", "BN", "BO", "BQ", "BR", "BS", "BT",
+    "BW", "BY", "BZ", "CA", "CD", "CF", "CG", "CH", "CI", "CL", "CM", "CN", "CO", "CR", "CU",
+    "CV", "CW", "CX", "CY", "CZ", "DE", "DJ", "DK", "DM", "DO", "DZ", "EC", "EE", "EG", "ER",
+    "ES", "ET", "FI", "FJ", "FK", "FM", "FO", "FR", "GA", "GB", "GD", "GE", "GF", "GG", "GH",
+    "GI", "GL", "GM", "GN", "GP", "GQ", "GR", "GT", "GW", "GY", "HK", "HN", "HR", "HT", "HU",
+    "ID", "IE", "IL", "IM", "IN", "IQ", "IR", "IS", "IT", "JE", "JM", "JO", "JP", "KE", "KG",
+    "KH", "KI", "KM", "KN", "KP", "KR", "KW", "KZ", "LA", "LB", "LC", "LI", "LK", "LR", "LS",
+    "LT", "LU", "LV", "LY", "MA", "MC", "MD", "ME", "MF", "MG", "MK", "ML", "MM", "MN", "MO",
+    "MQ", "MR", "MS", "MT", "MU", "MV", "MW", "MX", "MY", "MZ", "NC", "NE", "NG", "NI", "NL",
+    "NO", "NP", "NZ", "OM", "PA", "PE", "PF", "PG", "PH", "PK", "PL", "PR", "PS", "PT", "PW",
+    "PY", "QA", "RE", "RO", "RS", "RU", "RW", "SA", "SB", "SD", "SE", "SG", "SI", "SJ", "SK",
+    "SL", "SM", "SN", "SO", "SR", "SS", "ST", "SV", "SX", "SY", "SZ", "TC", "TD", "TG", "TH",
+    "TJ", "TL", "TM", "TN", "TR", "TT", "TW", "TZ", "UA", "UG", "US", "UY", "UZ", "VA", "VC",
+    "VE", "VG", "VI", "VN", "VU", "WS", "XK", "YE", "YT", "ZA", "ZM", "ZW"
+]
+RESNET_TRANSFORM = {"resize": 256, "center_crop": 224,
+                    "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, features, dropout=0.3):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(features, features), nn.BatchNorm1d(features), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(features, features), nn.BatchNorm1d(features),
+        )
+        self.activation = nn.GELU()
+
+    def forward(self, x):
+        return self.activation(x + self.block(x))
+
+
+class ResNetHead(nn.Module):
+    """The residual MLP head trained in resnet_model.ipynb (layer names must match its state_dict)."""
+
+    def __init__(self, n, in_features=2048):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(in_features, 1024), nn.BatchNorm1d(1024), nn.GELU(), nn.Dropout(0.3),
+            ResidualBlock(1024, dropout=0.3),
+            nn.Linear(1024, 512), nn.BatchNorm1d(512), nn.GELU(), nn.Dropout(0.3),
+            ResidualBlock(512, dropout=0.2),
+            nn.Linear(512, n),
+        )
+
+    def forward(self, x):
+        return self.fc(x)
+
+
 class ResNetCountry:
-    """ResNet-101 features -> linear head over countries."""
+    """ResNet-101 features -> head over countries.
+
+    Accepts either the raw state_dict saved by resnet_model.ipynb (train_model_sample_1.pt, an MLP
+    head) or a bundle from export_demo.py ({"classes", "transform", "head"}, a linear head).
+    """
 
     def __init__(self, path=MODEL_DIR / "resnet_country.pt", device="cpu"):
         import torchvision.models as models
         b = torch.load(path, map_location="cpu", weights_only=False)
-        self.classes = b["classes"]
-        self.transform = make_transform(b["transform"])
+        bundle = isinstance(b, dict) and "head" in b
+        state = b["head"] if bundle else b
+        self.classes = b["classes"] if bundle else RESNET_CLASSES
+        self.transform = make_transform(b["transform"] if bundle else RESNET_TRANSFORM)
+        if "fc.10.weight" in state:  # notebook MLP head
+            n_out = state["fc.10.weight"].shape[0]
+            self.head = ResNetHead(n_out)
+        else:  # single linear layer
+            state = {k.removeprefix("fc."): v for k, v in state.items()}
+            n_out = state["weight"].shape[0]
+            self.head = nn.Linear(2048, n_out)
+        if n_out != len(self.classes):
+            raise ValueError(f"{path} predicts {n_out} classes but {len(self.classes)} country labels are known.")
+        self.head.load_state_dict(state)
         self.backbone = models.resnet101(weights=models.ResNet101_Weights.DEFAULT)
         self.backbone.fc = nn.Identity()
-        self.head = nn.Linear(2048, len(self.classes))
-        self.head.load_state_dict({k.removeprefix("fc."): v for k, v in b["head"].items()})
         self.device = device
         self.backbone.to(device).eval()
-        self.head.to(device).eval()
+        self.head.to(device).eval()  # eval() matters: the MLP has BatchNorm and Dropout
 
     @torch.no_grad()
-    def predict(self, image, k=5):
+    def predict(self, image, k=3):
         x = self.transform(image.convert("RGB")).unsqueeze(0).to(self.device)
         probs = self.head(self.backbone(x)).softmax(1)[0].cpu()
         p, i = probs.topk(min(k, len(self.classes)))

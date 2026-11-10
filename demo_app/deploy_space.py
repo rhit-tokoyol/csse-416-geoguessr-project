@@ -29,6 +29,7 @@ def space_files():
         (ROOT / "demo_app/space/README.md", "README.md"),
         (ROOT / "demo_app/app.py", "demo_app/app.py"),
         (ROOT / "demo_app/index.html", "demo_app/index.html"),
+        (ROOT / "demo_app/country_centers.py", "demo_app/country_centers.py"),
         (ROOT / "demo_predict.py", "demo_predict.py"),
         (ROOT / "driving_side.py", "driving_side.py"),
     ]
