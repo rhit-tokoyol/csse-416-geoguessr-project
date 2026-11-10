@@ -27,6 +27,9 @@ DATA = Path("/work/cssema416/202710/11/datasets/OpenWorld")
 
 RESNET_TRANSFORM = {"resize": 256, "center_crop": 224,
                     "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}
+CLIP_CROP_TRANSFORM = {"resize": 224, "center_crop": 224,
+                       "mean": [0.48145466, 0.4578275, 0.40821073],
+                       "std": [0.26862954, 0.26130258, 0.27577711]}
 CLIP_TRANSFORM = {"resize": [224, 224], "center_crop": None,
                   "mean": [0.48145466, 0.4578275, 0.40821073],
                   "std": [0.26862954, 0.26130258, 0.27577711]}
@@ -58,12 +61,19 @@ def export_resnet(head_path, csv_path, out_path):
     print(f"ResNet: {n} countries -> {out_path}")
 
 
-def export_clip(head_path, csv_path, out_path, fusion_weight):
-    state = torch.load(head_path, map_location="cpu")
+PLAIN_RENAME = {"net.0.weight": "trunk.0.weight", "net.0.bias": "trunk.0.bias",
+                "net.3.weight": "cell_out.weight", "net.3.bias": "cell_out.bias"}
+
+
+def export_clip(head_path, csv_path, out_path, fusion_weight, center_crop=False):
+    # Heads: "mirror" (current driving_side.MultiTaskHead), "shared" (run 1: side_out on the
+    # shared layer) or "plain" (no driving side; the older MLPHead's net.0/net.3 are renamed).
+    state = {PLAIN_RENAME.get(k, k): v for k, v in torch.load(head_path, map_location="cpu").items()}
     n = out_dim(state, "cell_out.weight")
-    if "side_net.0.weight" not in state:
-        raise SystemExit("This CLIP head has no mirror-based side detector (side_net). "
-                         "Export a run made with the current driving_side.py.")
+    kind = "mirror" if "side_net.0.weight" in state else "shared" if "side_out.weight" in state else "plain"
+    if kind != "mirror":
+        print(f"Note: {head_path} is a '{kind}' head. The GitHub Pages site can run it; "
+              "the Flask demo (demo_predict.py) only runs mirror heads.")
     # main.ipynb: LabelEncoder().fit(df["cell"]) over every row of train.csv.
     df = pd.read_csv(csv_path, usecols=["latitude", "longitude", "cell", "country"])
     df["cell"] = df["cell"].astype(str)
@@ -81,19 +91,20 @@ def export_clip(head_path, csv_path, out_path, fusion_weight):
     torch.save({
         "kind": "clip_cell",
         "backbone": "openai/clip-vit-base-patch32 (vision_model + visual_projection)",
-        "head": state,                      # driving_side.MultiTaskHead
+        "head": state,                      # driving_side.MultiTaskHead when head_kind is "mirror"
+        "head_kind": kind,
         "head_kwargs": {"n_cells": n, "in_dim": state["trunk.0.weight"].shape[1],
                         "hidden": state["trunk.0.weight"].shape[0],
-                        "side_hidden": state["side_net.0.weight"].shape[0]},
+                        "side_hidden": state["side_net.0.weight"].shape[0]} if kind == "mirror" else None,
         "cells": classes,
         "cell_lat": stats["lat"].tolist(),
         "cell_lon": stats["lon"].tolist(),
         "cell_country": stats["country"].tolist(),
         "cell_left": stats["left"].fillna(0.5).tolist(),
         "fusion_weight": fusion_weight,
-        "transform": CLIP_TRANSFORM,
+        "transform": CLIP_CROP_TRANSFORM if center_crop else CLIP_TRANSFORM,
     }, out_path)
-    print(f"CLIP: {n} cells, fusion weight {fusion_weight} -> {out_path}")
+    print(f"CLIP: {n} cells, {kind} head, fusion weight {fusion_weight} -> {out_path}")
 
 
 if __name__ == "__main__":
@@ -104,6 +115,10 @@ if __name__ == "__main__":
     p.add_argument("--clip-csv", type=Path, default=DATA / "train.csv")
     p.add_argument("--fusion-weight", type=float, default=1.0,
                    help="'Chosen fusion weight' printed by cell 14 of the CLIP run")
+    p.add_argument("--center-crop", action="store_true",
+                   help="the CLIP run used Resize(224) + CenterCrop(224) (run 1), not the whole photo")
+    p.add_argument("--clip-out", default="clip_cell.pt",
+                   help="file name for the CLIP export, e.g. clip_run3.pt to keep the current one")
     p.add_argument("--out", type=Path, default=Path("demo_models"))
     a = p.parse_args()
     if not (a.resnet_head or a.clip_head):
@@ -112,4 +127,4 @@ if __name__ == "__main__":
     if a.resnet_head:
         export_resnet(a.resnet_head, a.resnet_csv, a.out / "resnet_country.pt")
     if a.clip_head:
-        export_clip(a.clip_head, a.clip_csv, a.out / "clip_cell.pt", a.fusion_weight)
+        export_clip(a.clip_head, a.clip_csv, a.out / a.clip_out, a.fusion_weight, a.center_crop)

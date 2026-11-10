@@ -87,6 +87,11 @@
   .truepin { background: #111; color: #fff; border-radius: 4px; padding: 0 5px; font: 600 11px var(--mono); white-space: nowrap; border: 2px solid #fff; width: auto !important; height: auto !important; }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 
+  .models { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; text-align: right; }
+  .modelrow { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px 8px; }
+  .modelrow b { color: var(--fg); font-weight: 600; }
+  button.small { font: 600 .8rem var(--body); padding: 3px 10px; border-radius: 6px; }
+  @media (max-width: 900px) { .models { align-items: flex-start; text-align: left; } .modelrow { justify-content: flex-start; } }
   .models select { font: .8rem var(--mono); color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 2px 4px; margin-left: 6px; }
   .how { font-size: .92rem; color: var(--muted); margin: 0; }
   .how a { color: var(--accent); }
@@ -101,7 +106,15 @@
       <h1>Where is this?</h1>
       <p>Drop in a GeoGuessr screenshot and see where our model would guess. It runs entirely in your browser.</p>
     </div>
-    <div class="models"><span id="models">Loading model…</span><label for="dtype" style="margin-left:10px">CLIP size</label><select id="dtype"><option value="fp16">standard, 176 MB</option><option value="fp32">full precision, 352 MB</option></select></div>
+    <div class="models">
+      <div><span id="models">Loading model…</span><label for="dtype" style="margin-left:10px">CLIP size</label><select id="dtype"><option value="fp16">standard, 176 MB</option><option value="fp32">full precision, 352 MB</option></select></div>
+      <div class="modelrow">
+        <span>Model: <b id="modelName">built-in</b> <span id="modelInfo"></span></span>
+        <button class="small" id="loadModel" title="Load a .geomodel file made with export_web.py --bundle">Load a model…</button>
+        <button class="small" id="useBuiltIn" hidden>Use built-in</button>
+        <input type="file" id="modelFile" accept=".geomodel" hidden>
+      </div>
+    </div>
   </header>
 
   <div class="grid">
@@ -141,7 +154,7 @@
           CLIP ViT-B/32 turns the image into features, and a head we trained on
           <a href="https://huggingface.co/datasets/osv5m/osv5m">OpenStreetView-5M</a> picks one of 1,905 map cells.
           A second head compares the image with its mirror image to tell which side of the road traffic drives on,
-          and that adjusts the guess. CSSE 416, Rose-Hulman.</p>
+          and that adjusts the guess. <b>Load a model</b> tries a different trained head from a .geomodel file; the file stays on your computer. CSSE 416, Rose-Hulman.</p>
         </div>
         <div class="side">
           <h2>Driving side</h2>
@@ -239,11 +252,50 @@ $("dtype").addEventListener("change", () => { $("models").textContent = "Loading
 const saveData = navigator.connection?.saveData === true;
 geo.loadHead()
   .then(m => {
+    showModel(m);
     if (saveData) { $("models").textContent = `${m.cells.length.toLocaleString()} cells · loads CLIP (176 MB) on first guess`; return; }
     $("models").textContent = "Loading CLIP…";
     return ensureModel().catch(e => setStatus(`Couldn't load CLIP: ${e.message}`, true));
   })
   .catch(() => { $("models").textContent = "Couldn't load the model files."; });
+
+// ---------- switching models ----------
+// A .geomodel file (export_web.py --bundle) replaces the built-in head. It's read in the
+// browser and never uploaded anywhere; reloading the page goes back to the built-in model.
+let builtInMeta = null;
+const KIND_TEXT = { mirror: "mirror driving side", shared: "run-1 driving side", plain: "no driving side" };
+function showModel(m) {
+  if (!builtInMeta) builtInMeta = m;
+  $("modelName").textContent = m.name;
+  $("modelInfo").textContent = `(${m.cells.length.toLocaleString()} cells, ${KIND_TEXT[m.head_kind]}${
+    m.head_kind !== "plain" ? `, weight ${m.fusion_weight}` : ""}${m.center_crop ? ", center crop" : ""})`;
+  $("useBuiltIn").hidden = m === builtInMeta;
+}
+function afterModelChange(m, message) {
+  showModel(m);
+  setStatus(message);
+  if (bitmap && !$("go").disabled) $("go").click();   // re-guess the current screenshot with the new model
+  else resetResults();
+}
+function resetResults() {
+  layer.clearLayers(); topGuess = null;
+  for (const id of ["clipList"]) { const li = document.createElement("li"); li.className = "empty"; li.textContent = "No guess yet."; $(id).replaceChildren(li); }
+  $("sideDot").style.left = "50%"; $("sideText").className = "empty"; $("sideText").textContent = "No guess yet.";
+  $("plainNote").hidden = true;
+}
+$("loadModel").addEventListener("click", () => $("modelFile").click());
+$("modelFile").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (!file) return;
+  try {
+    const m = await geo.loadBundle(file);
+    afterModelChange(m, `Loaded “${m.name}”.`);
+  } catch (err) {
+    setStatus(`Couldn’t load that model: ${err.message}`, true);
+  }
+});
+$("useBuiltIn").addEventListener("click", () => afterModelChange(geo.useBuiltIn(), "Back to the built-in model."));
 
 // ---------- input ----------
 let imageFile = null, bitmap = null, crop = null;
@@ -325,7 +377,8 @@ $("go").addEventListener("click", async () => {
     setStatus("Thinking…");
     const out = await geo.predict(bitmap, { crop });
     show(out);
-    setStatus(`Guessed from a ${out.size[0]}×${out.size[1]} image${crop ? " (cropped)" : ""}.`);
+    const m = geo.activeModel();
+    setStatus(`Guessed from a ${out.size[0]}×${out.size[1]} image${crop ? " (cropped)" : ""}${m === builtInMeta ? "" : ` with “${m.name}”`}.`);
   } catch (err) {
     setStatus(`Something went wrong: ${err.message}`, true);
   } finally { $("go").disabled = false; }
@@ -347,11 +400,18 @@ function show(data) {
   topGuess = [gs[0].lat, gs[0].lon];
   map.fitBounds(L.latLngBounds(gs.map(g => [g.lat, g.lon])).pad(0.6), { maxZoom: 6 });
 
-  const pl = data.p_left_driving, sure = Math.max(pl, 1 - pl);
-  $("sideDot").style.left = ((1 - pl) * 100) + "%";
-  $("sideText").className = "";
-  $("sideText").textContent = sure < 0.6 ? "Can't tell which side traffic drives on from this view."
-    : `Drives on the ${pl > 0.5 ? "left" : "right"} · ${pct(sure)} sure`;
+  const pl = data.p_left_driving;
+  if (pl === null) {
+    $("sideDot").style.left = "50%";
+    $("sideText").className = "empty";
+    $("sideText").textContent = "This model has no driving-side output.";
+  } else {
+    const sure = Math.max(pl, 1 - pl);
+    $("sideDot").style.left = ((1 - pl) * 100) + "%";
+    $("sideText").className = "";
+    $("sideText").textContent = sure < 0.6 ? "Can't tell which side traffic drives on from this view."
+      : `Drives on the ${pl > 0.5 ? "left" : "right"} · ${pct(sure)} sure`;
+  }
 
   const plain = data.plain_top;
   if (plain && plain.cell !== gs[0].cell) {

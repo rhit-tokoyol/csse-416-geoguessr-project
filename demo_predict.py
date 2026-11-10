@@ -58,6 +58,9 @@ class ClipCell:
     def __init__(self, path=MODEL_DIR / "clip_cell.pt", device="cpu"):
         from transformers import CLIPModel
         b = torch.load(path, map_location="cpu", weights_only=False)
+        if b.get("head_kind", "mirror") != "mirror":
+            raise ValueError(f"{path} has a '{b['head_kind']}' head; this demo runs only mirror heads. "
+                             "Load it on the GitHub Pages site instead (export_web.py --bundle).")
         self.b = b
         self.transform = make_transform(b["transform"])
         clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
