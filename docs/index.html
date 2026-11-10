@@ -97,6 +97,9 @@
   .how a { color: var(--accent); }
   .progress { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; margin-top: 6px; }
   .progress i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  #resnetLabel { font: 400 .8rem var(--mono); color: var(--muted); cursor: pointer; }
+  #resnetLabel input { vertical-align: middle; margin: 0 4px 0 0; }
+  #resnetCard h2::after { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #2563eb; margin-left: 8px; }
 </style>
 </head>
 <body>
@@ -113,6 +116,11 @@
         <button class="small" id="loadModel" title="Load a .geomodel file made with export_web.py --bundle">Load a model…</button>
         <button class="small" id="useBuiltIn" hidden>Use built-in</button>
         <input type="file" id="modelFile" accept=".geomodel" hidden>
+      </div>
+      <div class="modelrow">
+        <button class="small" id="loadResnet" title="Load a .resnetmodel file made with pack_resnet_bundle.py">Load ResNet…</button>
+        <input type="file" id="resnetFile" accept=".resnetmodel" hidden>
+        <label id="resnetLabel" hidden title="Also guess the country with a ResNet-101 model."><input type="checkbox" id="useResnet"><span id="resnetText"></span></label>
       </div>
     </div>
   </header>
@@ -147,6 +155,11 @@
           <h2>CLIP · map cell</h2>
           <ol class="guesses" id="clipList"><li class="empty">No guess yet.</li></ol>
           <p class="note" id="plainNote" hidden></p>
+        </div>
+        <div id="resnetCard" hidden>
+          <h2>ResNet · country</h2>
+          <ol class="guesses" id="resnetList"><li class="empty">Off. Tick “Also run ResNet” to try it.</li></ol>
+          <p class="note">Country guesses are pinned at a rough country centre (blue dots), so they can sit far from where the photo was taken in big countries.</p>
         </div>
         <div>
           <h2>How it works</h2>
@@ -282,6 +295,7 @@ function resetResults() {
   for (const id of ["clipList"]) { const li = document.createElement("li"); li.className = "empty"; li.textContent = "No guess yet."; $(id).replaceChildren(li); }
   $("sideDot").style.left = "50%"; $("sideText").className = "empty"; $("sideText").textContent = "No guess yet.";
   $("plainNote").hidden = true;
+  resetResnet();
 }
 $("loadModel").addEventListener("click", () => $("modelFile").click());
 $("modelFile").addEventListener("change", async (e) => {
@@ -360,7 +374,8 @@ function renderList(el, items) {
     const name = document.createElement("span"); name.className = "name";
     name.textContent = `${flag(g.country)} ${regionName(g.country)}`.trim();
     const p = document.createElement("span"); p.className = "pct"; p.textContent = pct(g.prob);
-    const c = document.createElement("span"); c.className = "coords"; c.textContent = `cell ${g.cell} · ${fmtCoord(g.lat, g.lon)}`;
+    const c = document.createElement("span"); c.className = "coords";
+    c.textContent = `${g.cell !== undefined ? `cell ${g.cell}` : "country centre"} · ${fmtCoord(g.lat, g.lon)}`;
     const bar = document.createElement("span"); bar.className = "bar";
     const fill = document.createElement("i"); fill.style.width = Math.max(g.prob * 100, 1) + "%"; bar.append(fill);
     li.append(rank, name, p, c, bar);
@@ -377,12 +392,83 @@ $("go").addEventListener("click", async () => {
     setStatus("Thinking…");
     const out = await geo.predict(bitmap, { crop });
     show(out);
+    let resnetErr = null;
+    if ($("useResnet").checked) resnetErr = await runResnet();
+    else resetResnet();
     const m = geo.activeModel();
-    setStatus(`Guessed from a ${out.size[0]}×${out.size[1]} image${crop ? " (cropped)" : ""}${m === builtInMeta ? "" : ` with “${m.name}”`}.`);
+    setStatus(`Guessed from a ${out.size[0]}×${out.size[1]} image${crop ? " (cropped)" : ""}${m === builtInMeta ? "" : ` with “${m.name}”`}.`
+      + (resnetErr ? ` ResNet didn't run: ${resnetErr}` : ""), !!resnetErr);
   } catch (err) {
     setStatus(`Something went wrong: ${err.message}`, true);
   } finally { $("go").disabled = false; }
 });
+
+// ---------- optional ResNet (country) model ----------
+// docs/resnet.js is imported only when it's needed, so a missing model or a blocked download
+// leaves the CLIP guesses untouched. The option appears only if model/resnet_meta.json exists.
+let resnetMod = null;
+fetch("model/resnet_meta.json").then(r => r.ok ? r.json() : null).then(m => {
+  if (!m || resnetFromFile) return;
+  $("resnetText").textContent = `Also run ResNet (country guesses, ${m.size_mb ?? "?"} MB download)`;
+  $("resnetLabel").hidden = false; $("resnetCard").hidden = false;
+}).catch(() => {});
+
+// "Load ResNet…": one .resnetmodel file (pack_resnet_bundle.py) holds the model and its metadata.
+// It's read in the browser and never uploaded; reloading the page forgets it.
+let resnetFromFile = false;
+$("loadResnet").addEventListener("click", () => $("resnetFile").click());
+$("resnetFile").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (!file) return;
+  try {
+    setStatus("Reading the ResNet file…");
+    resnetMod ??= await import("./resnet.js");
+    const m = await resnetMod.loadBundle(file);
+    resnetFromFile = true;
+    $("resnetText").textContent = `Run ResNet: ${m.name || file.name} (from your file)`;
+    $("resnetLabel").hidden = false; $("resnetCard").hidden = false; $("useResnet").checked = true;
+    setStatus(`Loaded the ResNet model “${m.name || file.name}”.`);
+    if (bitmap && !$("go").disabled) $("go").click();   // guess the current screenshot again with it
+  } catch (err) {
+    setStatus(`Couldn’t load that ResNet file: ${err.message}`, true);
+  }
+});
+
+function resetResnet() {
+  const li = document.createElement("li"); li.className = "empty"; li.textContent = "Off. Tick “Also run ResNet” to try it.";
+  $("resnetList").replaceChildren(li);
+}
+
+// Returns null on success, or a short reason it failed.
+async function runResnet() {
+  try {
+    resnetMod ??= await import("./resnet.js");
+    setStatus("Loading ResNet…");
+    await resnetMod.load((loaded, total) => {
+      $("progress").hidden = false; $("progressBar").style.width = (100 * loaded / total) + "%";
+      setStatus(`Downloading ResNet (first visit only): ${mb(loaded)} of ${mb(total)} MB`);
+    });
+    $("progress").hidden = true;
+    setStatus("Thinking…");
+    const items = await resnetMod.predict(bitmap, { crop, k: 3 });
+    renderList($("resnetList"), items);
+    items.slice().reverse().forEach((g, ri) => {
+      const i = items.length - 1 - ri;
+      L.circleMarker([g.lat, g.lon], { radius: i ? 6 : 9, color: "#fff", weight: 2, fillColor: "#2563eb", fillOpacity: 0.9 })
+        .bindTooltip(`ResNet ${i + 1}. ${regionName(g.country)} · ${pct(g.prob)}`).addTo(layer);
+    });
+    const b = L.latLngBounds([]);
+    layer.eachLayer(l => b.extend(l.getLatLng()));
+    map.fitBounds(b.pad(0.6), { maxZoom: 6 });
+    return null;
+  } catch (err) {
+    $("progress").hidden = true;
+    const li = document.createElement("li"); li.className = "empty"; li.textContent = "ResNet didn't run.";
+    $("resnetList").replaceChildren(li);
+    return err.message;
+  }
+}
 
 function show(data) {
   layer.clearLayers();
