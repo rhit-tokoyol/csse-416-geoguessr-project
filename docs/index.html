@@ -218,8 +218,11 @@ function ensureModel() {
       $("progressBar").style.width = (100 * loaded / total) + "%";
       setStatus(`Downloading CLIP (first visit only): ${mb(loaded)} of ${mb(total)} MB`);
     }
-  })).then(() => {
+  })).then(async () => {
     $("progress").hidden = true;
+    $("models").textContent = "Warming up CLIP…";
+    if ($("status").textContent.startsWith("Downloading CLIP")) setStatus("");
+    await geo.warmUp();   // the first run sets up the model; do it now so the first real guess is quick
     $("models").textContent = `CLIP (${dtype === "fp16" ? "standard" : "full precision"}) ready`;
   }).catch((err) => {
     ready = null; $("progress").hidden = true;
@@ -230,8 +233,16 @@ function ensureModel() {
   return promise;
 }
 $("dtype").addEventListener("change", () => { $("models").textContent = "Loading model…"; ensureModel().catch(e => setStatus(e.message, true)); });
+// Preload CLIP as soon as the page opens, so it's usually ready by the time someone pastes a
+// screenshot. After the first visit the browser keeps it, and later visits load it in seconds.
+// Visitors who turned on data saving download it only when they ask for a guess.
+const saveData = navigator.connection?.saveData === true;
 geo.loadHead()
-  .then(m => { $("models").textContent = `${m.cells.length.toLocaleString()} cells · loads CLIP on first guess`; })
+  .then(m => {
+    if (saveData) { $("models").textContent = `${m.cells.length.toLocaleString()} cells · loads CLIP (176 MB) on first guess`; return; }
+    $("models").textContent = "Loading CLIP…";
+    return ensureModel().catch(e => setStatus(`Couldn't load CLIP: ${e.message}`, true));
+  })
   .catch(() => { $("models").textContent = "Couldn't load the model files."; });
 
 // ---------- input ----------
@@ -246,8 +257,8 @@ async function useFile(file) {
   preview.src = URL.createObjectURL(file);
   drop.hidden = true; stage.hidden = false; $("cropHint").hidden = false;
   $("another").hidden = false; $("clearCrop").hidden = true; $("go").disabled = false;
-  setStatus("");
-  ensureModel().catch(e => setStatus(`Couldn't load CLIP: ${e.message}`, true));   // start downloading early
+  if (!$("status").textContent.startsWith("Downloading CLIP")) setStatus("");
+  ensureModel().catch(e => setStatus(`Couldn't load CLIP: ${e.message}`, true));   // no-op if already loading
 }
 window.useFile = useFile;
 drop.addEventListener("click", () => $("file").click());

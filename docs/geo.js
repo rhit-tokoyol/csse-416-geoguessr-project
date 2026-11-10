@@ -33,6 +33,14 @@ export async function loadClip(dtype = "fp16", onProgress = () => {}) {
   clipDtype = dtype;
 }
 
+// One throwaway run on a blank image: the model's first run is slow because it sets itself up,
+// so doing it in the background makes the visitor's first real guess fast.
+export async function warmUp() {
+  const c = document.createElement("canvas");
+  c.width = meta.image_size[0]; c.height = meta.image_size[1];
+  await predict(c);
+}
+
 // PIL's BILINEAR resize (Image.resize), which training used through torchvision.
 // When shrinking it averages over a triangle filter as wide as the scale factor (antialiasing),
 // then rounds to 8 bits after each pass. The browser's canvas resize does not, and CLIP's
