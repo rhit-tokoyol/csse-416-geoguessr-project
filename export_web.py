@@ -29,7 +29,9 @@ MAGIC = b"GEOMODEL1\n"
 
 ORDER = ["trunk.0.weight", "trunk.0.bias", "cell_out.weight", "cell_out.bias",
          "side_net.0.weight", "side_net.0.bias", "side_net.3.weight", "side_net.3.bias",
-         "side_out.weight", "side_out.bias"]
+         "side_out.weight", "side_out.bias",
+         "stem0.weight", "stem0.bias", "res1a.weight", "res1a.bias", "res1b.weight", "res1b.bias",
+         "stem1.weight", "stem1.bias", "res2a.weight", "res2a.bias", "res2b.weight", "res2b.bias"]
 RENAME = {"net.0.weight": "trunk.0.weight", "net.0.bias": "trunk.0.bias",      # plain MLPHead
           "net.3.weight": "cell_out.weight", "net.3.bias": "cell_out.bias"}
 
@@ -42,12 +44,37 @@ def head_kind(state):
     return "plain"
 
 
+def fold_residual(sd):
+    """The residual MLP head (Head in the notebook) with every BatchNorm folded into the Linear before it,
+    so the page only needs Linear + GELU + skip connections. In eval mode BatchNorm1d computes
+    gamma * (z - running_mean) / sqrt(running_var + eps) + beta, a scale and shift of the Linear's output z."""
+    def lin_bn(lin, bn):
+        for key in (f"{lin}.weight", f"{lin}.bias", f"{bn}.weight", f"{bn}.bias", f"{bn}.running_mean", f"{bn}.running_var"):
+            if key not in sd:
+                sys.exit(f"The residual head is missing '{key}'; found keys like {sorted(sd)[:6]}")
+        w, b = sd[f"{lin}.weight"].double(), sd[f"{lin}.bias"].double()
+        s = sd[f"{bn}.weight"].double() / torch.sqrt(sd[f"{bn}.running_var"].double() + 1e-5)
+        return (w * s[:, None]).float(), ((b - sd[f"{bn}.running_mean"].double()) * s + sd[f"{bn}.bias"].double()).float()
+    layers = {"stem0": ("fc.0", "fc.1"),
+              "res1a": ("fc.4.block.0", "fc.4.block.1"), "res1b": ("fc.4.block.4", "fc.4.block.5"),
+              "stem1": ("fc.5", "fc.6"),
+              "res2a": ("fc.9.block.0", "fc.9.block.1"), "res2b": ("fc.9.block.4", "fc.9.block.5")}
+    out = {}
+    for name, (lin, bn) in layers.items():
+        out[f"{name}.weight"], out[f"{name}.bias"] = lin_bn(lin, bn)
+    out["cell_out.weight"], out["cell_out.bias"] = sd["fc.10.weight"].float(), sd["fc.10.bias"].float()
+    return out
+
+
 def build(src, name):
     b = torch.load(src, map_location="cpu", weights_only=False)
-    state = {RENAME.get(k, k): v for k, v in b["head"].items()}
-    if "trunk.0.weight" not in state or "cell_out.weight" not in state:
-        sys.exit(f"{src}: the head has no trunk/cell_out layers; found {sorted(state)}")
-    kind = head_kind(state)
+    if b.get("head_kind") == "residual":
+        state, kind = fold_residual(b["head"]), "residual"
+    else:
+        state = {RENAME.get(k, k): v for k, v in b["head"].items()}
+        if "trunk.0.weight" not in state or "cell_out.weight" not in state:
+            sys.exit(f"{src}: the head has no trunk/cell_out layers; found {sorted(state)}")
+        kind = head_kind(state)
     index, chunks, offset = [], [], 0
     for key in ORDER:
         if key in state:
@@ -61,12 +88,12 @@ def build(src, name):
         "name": name,
         "head_kind": kind,
         "clip_model": b.get("web_model", "Xenova/clip-vit-base-patch32"),   # ONNX build the page loads
-        "clip_dim": state["trunk.0.weight"].shape[1],                       # features the head expects
+        "clip_dim": (state["stem0.weight"] if kind == "residual" else state["trunk.0.weight"]).shape[1],   # features the head expects
         "resize": t["resize"],              # [size, size] = squash whole photo; size = shorter side, then...
         "center_crop": t.get("center_crop"),  # ...a size x size center crop (run 1)
         "image_size": [size, size],
         "mean": t["mean"], "std": t["std"],
-        "fusion_weight": b["fusion_weight"] if kind != "plain" else 0.0,
+        "fusion_weight": b["fusion_weight"] if kind not in ("plain", "residual") else 0.0,
         "tensors": index,
         "cells": b["cells"],
         "cell_lat": [round(v, 5) for v in b["cell_lat"]],

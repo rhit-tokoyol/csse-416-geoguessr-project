@@ -277,12 +277,12 @@ geo.loadHead()
 // ---------- switching models ----------
 // A .geomodel file (export_web.py --bundle) replaces the built-in head. It's read in the
 // browser and never uploaded anywhere; reloading the page goes back to the built-in model.
-const KIND_TEXT = { mirror: "mirror driving side", shared: "run-1 driving side", plain: "no driving side" };
+const KIND_TEXT = { mirror: "mirror driving side", shared: "run-1 driving side", plain: "no driving side", residual: "residual MLP, no driving side" };
 function showModel(m) {
   $("modelName").textContent = m.name;
   if (geo.isBuiltIn(m) && m.base && [...$("builtinSel").options].some(o => o.value === m.base)) $("builtinSel").value = m.base;
   $("modelInfo").textContent = `(${m.cells.length.toLocaleString()} cells, ${KIND_TEXT[m.head_kind]}${
-    m.head_kind !== "plain" ? `, weight ${m.fusion_weight}` : ""}${m.center_crop ? ", center crop" : ""}, ${m.clip_model.split("/").pop()})`;
+    m.head_kind !== "plain" && m.head_kind !== "residual" ? `, weight ${m.fusion_weight}` : ""}${m.center_crop ? ", center crop" : ""}, ${m.clip_model.split("/").pop()})`;
   $("useBuiltIn").hidden = geo.isBuiltIn(m);          // shown only while a file the visitor loaded is active
 }
 function afterModelChange(m, message) {

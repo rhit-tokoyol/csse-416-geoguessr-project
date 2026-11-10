@@ -46,7 +46,9 @@ function useHead(m, floats, fallbackName) {
   if (!Number.isFinite(fw) || fw < 0 || fw > 20) fail("The model file’s fusion_weight must be between 0 and 20.");
 
   const allowed = new Set(["trunk.0.weight", "trunk.0.bias", "cell_out.weight", "cell_out.bias",
-    "side_net.0.weight", "side_net.0.bias", "side_net.3.weight", "side_net.3.bias", "side_out.weight", "side_out.bias"]);
+    "side_net.0.weight", "side_net.0.bias", "side_net.3.weight", "side_net.3.bias", "side_out.weight", "side_out.bias",
+    "stem0.weight", "stem0.bias", "res1a.weight", "res1a.bias", "res1b.weight", "res1b.bias",
+    "stem1.weight", "stem1.bias", "res2a.weight", "res2a.bias", "res2b.weight", "res2b.bias"]);
   const w = {};
   for (const t of Array.isArray(m.tensors) ? m.tensors : fail("The model file lists no weights.")) {
     if (!allowed.has(t?.name)) fail(`Unknown weight “${String(t?.name).slice(0, 40)}” in the model file.`);
@@ -59,21 +61,33 @@ function useHead(m, floats, fallbackName) {
     const s = w[name]?.shape || fail(`The model file is missing ${name}.`);
     if (s.length !== want.length || s.some((v, i) => v !== want[i])) fail(`${name} should be [${want}] but is [${s}].`);
   };
-  const hidden = w["trunk.0.weight"]?.shape[0] || fail("The model file is missing trunk.0.weight.");
-  shape("trunk.0.weight", [hidden, dim]); shape("trunk.0.bias", [hidden]);
-  shape("cell_out.weight", [n, hidden]); shape("cell_out.bias", [n]);
   let k = "plain";
-  if (w["side_net.0.weight"]) {
-    const s = w["side_net.0.weight"].shape[0];
-    shape("side_net.0.weight", [s, dim]); shape("side_net.0.bias", [s]);
-    shape("side_net.3.weight", [1, s]); shape("side_net.3.bias", [1]);
-    k = "mirror";
-  } else if (w["side_out.weight"]) {
-    shape("side_out.weight", [1, hidden]); shape("side_out.bias", [1]);
-    k = "shared";
+  if (w["stem0.weight"]) {
+    // Residual MLP head (export_web.py folds its BatchNorm layers into the Linear layers): stem0, a
+    // residual block (res1a, res1b), stem1, a second block (res2a, res2b), then cell_out. No driving side.
+    const w1 = w["stem0.weight"].shape[0], w2 = w["stem1.weight"]?.shape[0] || fail("The model file is missing stem1.weight.");
+    shape("stem0.weight", [w1, dim]); shape("stem0.bias", [w1]);
+    for (const r of ["res1a", "res1b"]) { shape(`${r}.weight`, [w1, w1]); shape(`${r}.bias`, [w1]); }
+    shape("stem1.weight", [w2, w1]); shape("stem1.bias", [w2]);
+    for (const r of ["res2a", "res2b"]) { shape(`${r}.weight`, [w2, w2]); shape(`${r}.bias`, [w2]); }
+    shape("cell_out.weight", [n, w2]); shape("cell_out.bias", [n]);
+    k = "residual";
+  } else {
+    const hidden = w["trunk.0.weight"]?.shape[0] || fail("The model file is missing trunk.0.weight.");
+    shape("trunk.0.weight", [hidden, dim]); shape("trunk.0.bias", [hidden]);
+    shape("cell_out.weight", [n, hidden]); shape("cell_out.bias", [n]);
+    if (w["side_net.0.weight"]) {
+      const s = w["side_net.0.weight"].shape[0];
+      shape("side_net.0.weight", [s, dim]); shape("side_net.0.bias", [s]);
+      shape("side_net.3.weight", [1, s]); shape("side_net.3.bias", [1]);
+      k = "mirror";
+    } else if (w["side_out.weight"]) {
+      shape("side_out.weight", [1, hidden]); shape("side_out.bias", [1]);
+      k = "shared";
+    }
   }
   const name = (typeof m.name === "string" && m.name.trim() ? m.name.trim() : fallbackName).slice(0, 80);
-  meta = { ...m, name, cell_left: left, fusion_weight: k === "plain" ? 0 : fw, head_kind: k,
+  meta = { ...m, name, cell_left: left, fusion_weight: k === "plain" || k === "residual" ? 0 : fw, head_kind: k,
            clip_model: clipModel, clip_dim: dim, image_size: [S, S] };
   W = w; kind = k;
   return meta;
@@ -271,6 +285,26 @@ function linear(x, name) {          // y = W x + b, W stored [out, in] like torc
   return y;
 }
 const relu = (x) => x.map(v => (v > 0 ? v : 0));
+
+// ---------- residual MLP head ----------
+// Exact GELU, like torch.nn.GELU: x * Phi(x). erf is Abramowitz & Stegun 7.1.26 (error below 1.5e-7).
+function erf(x) {
+  const a = Math.abs(x), t = 1 / (1 + 0.3275911 * a);
+  const poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+  return Math.sign(x) * (1 - poly * Math.exp(-a * a));
+}
+const gelu = (x) => x.map(v => 0.5 * v * (1 + erf(v / Math.SQRT2)));
+// stem0 -> GELU -> [residual block] -> stem1 -> GELU -> [residual block] -> cell_out, where a residual
+// block is GELU(h + res_b(GELU(res_a(h)))). Dropout is off at prediction time.
+function residualLogits(f) {
+  let h = gelu(linear(f, "stem0"));
+  let r = linear(gelu(linear(h, "res1a")), "res1b");
+  h = gelu(h.map((v, i) => v + r[i]));
+  h = gelu(linear(h, "stem1"));
+  r = linear(gelu(linear(h, "res2a")), "res2b");
+  h = gelu(h.map((v, i) => v + r[i]));
+  return linear(h, "cell_out");
+}
 const sideNet = (f) => linear(relu(linear(f, "side_net.0")), "side_net.3")[0];
 
 // ---------- expected-score decoding ----------
@@ -339,8 +373,8 @@ export async function predict(source, { crop = null, k = 5, expected = true } = 
   const emb = image_embeds.data, d = image_embeds.dims[1];
   const f = emb.slice(0, d);
 
-  const h = relu(linear(f, "trunk.0"));
-  const logits = linear(h, "cell_out");
+  const h = kind === "residual" ? null : relu(linear(f, "trunk.0"));
+  const logits = kind === "residual" ? residualLogits(f) : linear(h, "cell_out");
   const m = Math.max(...logits);
   const lse = m + Math.log(logits.reduce((a, v) => a + Math.exp(v - m), 0));
   const logp = Array.from(logits, v => v - lse);

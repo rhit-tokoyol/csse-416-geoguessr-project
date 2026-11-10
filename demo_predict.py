@@ -144,8 +144,8 @@ class ClipCell:
         from transformers import CLIPModel
         b = torch.load(path, map_location="cpu", weights_only=False)
         self.kind = b.get("head_kind", "mirror")
-        if self.kind not in ("mirror", "plain"):
-            raise ValueError(f"{path} has a '{self.kind}' head; this demo runs mirror and plain heads. "
+        if self.kind not in ("mirror", "plain", "residual"):
+            raise ValueError(f"{path} has a '{self.kind}' head; this demo runs mirror, plain and residual heads. "
                              "Load it on the GitHub Pages site instead (export_web.py --bundle).")
         self.b = b
         self.transform = make_transform(b["transform"])
@@ -156,7 +156,10 @@ class ClipCell:
             w = b["head"]
             kw = {"n_cells": w["cell_out.weight"].shape[0], "in_dim": w["trunk.0.weight"].shape[1],
                   "hidden": w["trunk.0.weight"].shape[0]}
-        self.head = (MultiTaskHead if self.kind == "mirror" else PlainHead)(**kw)
+        if self.kind == "residual":      # the BatchNorm + residual-block head; ResNetHead has the same layout
+            self.head = ResNetHead(kw["n_cells"], kw["in_dim"])
+        else:
+            self.head = (MultiTaskHead if self.kind == "mirror" else PlainHead)(**kw)
         self.head.load_state_dict(b["head"])
         feat_dim = self.proj.out_features
         if kw["in_dim"] != feat_dim:

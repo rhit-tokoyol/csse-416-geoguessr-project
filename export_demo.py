@@ -76,13 +76,16 @@ def export_clip(head_path, csv_path, out_path, fusion_weight, center_crop=False,
     # shared layer) or "plain" (no driving side; the older MLPHead's net.0/net.3 are renamed).
     # The backbone is any CLIP vision model: the head's input size (feat_dim) is read from its weights.
     state = {PLAIN_RENAME.get(k, k): v for k, v in torch.load(head_path, map_location="cpu").items()}
-    n = out_dim(state, "cell_out.weight")
-    kind = "mirror" if "side_net.0.weight" in state else "shared" if "side_out.weight" in state else "plain"
-    if kind == "shared":
-        print(f"Note: {head_path} is a 'shared' head. The GitHub Pages site can run it; "
-              "the Flask demo (demo_predict.py) runs only mirror and plain heads.")
-    trunk = state["trunk.0.weight"]
-    feat_dim = trunk.shape[1]
+    if "fc.0.weight" in state and "fc.10.weight" in state:
+        # "residual": the BatchNorm + residual-block MLP (Head in the notebook), no driving side.
+        kind, n, feat_dim = "residual", state["fc.10.weight"].shape[0], state["fc.0.weight"].shape[1]
+    else:
+        n = out_dim(state, "cell_out.weight")
+        kind = "mirror" if "side_net.0.weight" in state else "shared" if "side_out.weight" in state else "plain"
+        feat_dim = state["trunk.0.weight"].shape[1]
+        if kind == "shared":
+            print(f"Note: {head_path} is a 'shared' head. The GitHub Pages site can run it; "
+                  "the Flask demo (demo_predict.py) runs mirror, plain and residual heads.")
     # Name of the same model for the browser (transformers.js needs an ONNX build). The default is a
     # guess that follows the Xenova naming; override it with --web-model if the repo is named differently.
     web_model = web_model or "Xenova/" + clip_model.split("/")[-1]
@@ -102,7 +105,9 @@ def export_clip(head_path, csv_path, out_path, fusion_weight, center_crop=False,
         "country": g["country"].agg(lambda s: s.mode().iat[0] if s.notna().any() else ""),
         "left": g["side"].mean(),
     }).reindex(classes)
-    head_kwargs = {"n_cells": n, "in_dim": feat_dim, "hidden": trunk.shape[0]}
+    head_kwargs = {"n_cells": n, "in_dim": feat_dim}
+    if kind != "residual":
+        head_kwargs["hidden"] = state["trunk.0.weight"].shape[0]
     if kind == "mirror":
         head_kwargs["side_hidden"] = state["side_net.0.weight"].shape[0]
     torch.save({
@@ -114,7 +119,7 @@ def export_clip(head_path, csv_path, out_path, fusion_weight, center_crop=False,
         "image_size": image_size,
         "head": state,                      # driving_side.MultiTaskHead when head_kind is "mirror"
         "head_kind": kind,
-        "head_kwargs": head_kwargs if kind in ("mirror", "plain") else None,
+        "head_kwargs": head_kwargs if kind in ("mirror", "plain", "residual") else None,
         "cells": classes,
         "cell_lat": stats["lat"].tolist(),
         "cell_lon": stats["lon"].tolist(),
