@@ -27,12 +27,17 @@ DATA = Path("/work/cssema416/202710/11/datasets/OpenWorld")
 
 RESNET_TRANSFORM = {"resize": 256, "center_crop": 224,
                     "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}
-CLIP_CROP_TRANSFORM = {"resize": 224, "center_crop": 224,
-                       "mean": [0.48145466, 0.4578275, 0.40821073],
-                       "std": [0.26862954, 0.26130258, 0.27577711]}
-CLIP_TRANSFORM = {"resize": [224, 224], "center_crop": None,
-                  "mean": [0.48145466, 0.4578275, 0.40821073],
-                  "std": [0.26862954, 0.26130258, 0.27577711]}
+DEFAULT_CLIP = "openai/clip-vit-base-patch32"
+CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]     # shared by OpenAI's CLIP variants
+CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
+
+
+def clip_transform(size, center_crop):
+    """How photos were resized for training: squash the whole photo to size x size, or
+    shorter side to `size` then a size x size center crop."""
+    if center_crop:
+        return {"resize": size, "center_crop": size, "mean": CLIP_MEAN, "std": CLIP_STD}
+    return {"resize": [size, size], "center_crop": None, "mean": CLIP_MEAN, "std": CLIP_STD}
 
 
 def out_dim(state, key):
@@ -65,15 +70,24 @@ PLAIN_RENAME = {"net.0.weight": "trunk.0.weight", "net.0.bias": "trunk.0.bias",
                 "net.3.weight": "cell_out.weight", "net.3.bias": "cell_out.bias"}
 
 
-def export_clip(head_path, csv_path, out_path, fusion_weight, center_crop=False):
+def export_clip(head_path, csv_path, out_path, fusion_weight, center_crop=False,
+                clip_model=DEFAULT_CLIP, web_model=None, image_size=224):
     # Heads: "mirror" (current driving_side.MultiTaskHead), "shared" (run 1: side_out on the
     # shared layer) or "plain" (no driving side; the older MLPHead's net.0/net.3 are renamed).
+    # The backbone is any CLIP vision model: the head's input size (feat_dim) is read from its weights.
     state = {PLAIN_RENAME.get(k, k): v for k, v in torch.load(head_path, map_location="cpu").items()}
     n = out_dim(state, "cell_out.weight")
     kind = "mirror" if "side_net.0.weight" in state else "shared" if "side_out.weight" in state else "plain"
-    if kind != "mirror":
-        print(f"Note: {head_path} is a '{kind}' head. The GitHub Pages site can run it; "
-              "the Flask demo (demo_predict.py) only runs mirror heads.")
+    if kind == "shared":
+        print(f"Note: {head_path} is a 'shared' head. The GitHub Pages site can run it; "
+              "the Flask demo (demo_predict.py) runs only mirror and plain heads.")
+    trunk = state["trunk.0.weight"]
+    feat_dim = trunk.shape[1]
+    # Name of the same model for the browser (transformers.js needs an ONNX build). The default is a
+    # guess that follows the Xenova naming; override it with --web-model if the repo is named differently.
+    web_model = web_model or "Xenova/" + clip_model.split("/")[-1]
+    print(f"Backbone {clip_model}: head expects {feat_dim}-d features, {image_size}px images. "
+          f"Browser model: {web_model}")
     # main.ipynb: LabelEncoder().fit(df["cell"]) over every row of train.csv.
     df = pd.read_csv(csv_path, usecols=["latitude", "longitude", "cell", "country"])
     df["cell"] = df["cell"].astype(str)
@@ -88,21 +102,26 @@ def export_clip(head_path, csv_path, out_path, fusion_weight, center_crop=False)
         "country": g["country"].agg(lambda s: s.mode().iat[0] if s.notna().any() else ""),
         "left": g["side"].mean(),
     }).reindex(classes)
+    head_kwargs = {"n_cells": n, "in_dim": feat_dim, "hidden": trunk.shape[0]}
+    if kind == "mirror":
+        head_kwargs["side_hidden"] = state["side_net.0.weight"].shape[0]
     torch.save({
         "kind": "clip_cell",
-        "backbone": "openai/clip-vit-base-patch32 (vision_model + visual_projection)",
+        "backbone": f"{clip_model} (vision_model + visual_projection)",
+        "clip_model": clip_model,           # Hugging Face name the Python demo loads
+        "web_model": web_model,             # ONNX build the browser loads (export_web.py)
+        "feat_dim": feat_dim,
+        "image_size": image_size,
         "head": state,                      # driving_side.MultiTaskHead when head_kind is "mirror"
         "head_kind": kind,
-        "head_kwargs": {"n_cells": n, "in_dim": state["trunk.0.weight"].shape[1],
-                        "hidden": state["trunk.0.weight"].shape[0],
-                        "side_hidden": state["side_net.0.weight"].shape[0]} if kind == "mirror" else None,
+        "head_kwargs": head_kwargs if kind in ("mirror", "plain") else None,
         "cells": classes,
         "cell_lat": stats["lat"].tolist(),
         "cell_lon": stats["lon"].tolist(),
         "cell_country": stats["country"].tolist(),
         "cell_left": stats["left"].fillna(0.5).tolist(),
         "fusion_weight": fusion_weight,
-        "transform": CLIP_CROP_TRANSFORM if center_crop else CLIP_TRANSFORM,
+        "transform": clip_transform(image_size, center_crop),
     }, out_path)
     print(f"CLIP: {n} cells, {kind} head, fusion weight {fusion_weight} -> {out_path}")
 
@@ -116,7 +135,14 @@ if __name__ == "__main__":
     p.add_argument("--fusion-weight", type=float, default=1.0,
                    help="'Chosen fusion weight' printed by cell 14 of the CLIP run")
     p.add_argument("--center-crop", action="store_true",
-                   help="the CLIP run used Resize(224) + CenterCrop(224) (run 1), not the whole photo")
+                   help="the CLIP run used Resize(size) + CenterCrop(size) (run 1), not the whole photo")
+    p.add_argument("--clip-model", default=DEFAULT_CLIP,
+                   help="Hugging Face name of the CLIP backbone the head was trained on, "
+                        "e.g. openai/clip-vit-large-patch14")
+    p.add_argument("--web-model", default=None,
+                   help="the same backbone as an ONNX build for the browser (default: Xenova/<model name>)")
+    p.add_argument("--image-size", type=int, default=224,
+                   help="input size the backbone was trained with (224 for most CLIPs, 336 for the -336 variants)")
     p.add_argument("--clip-out", default="clip_cell.pt",
                    help="file name for the CLIP export, e.g. clip_run3.pt to keep the current one")
     p.add_argument("--out", type=Path, default=Path("demo_models"))
@@ -127,4 +153,5 @@ if __name__ == "__main__":
     if a.resnet_head:
         export_resnet(a.resnet_head, a.resnet_csv, a.out / "resnet_country.pt")
     if a.clip_head:
-        export_clip(a.clip_head, a.clip_csv, a.out / a.clip_out, a.fusion_weight, a.center_crop)
+        export_clip(a.clip_head, a.clip_csv, a.out / a.clip_out, a.fusion_weight, a.center_crop,
+                    a.clip_model, a.web_model, a.image_size)

@@ -340,11 +340,17 @@ function show(data) {
     map.fitBounds(L.latLngBounds(gs.map(g => [g.lat, g.lon])).pad(0.6), { maxZoom: 6 });
 
     const pl = data.clip.p_left_driving;
-    $("sideDot").style.left = ((1 - pl) * 100) + "%";
-    const sure = Math.max(pl, 1 - pl);
-    $("sideText").className = "";
-    $("sideText").textContent = sure < 0.6 ? "Can't tell which side traffic drives on from this view."
-      : `Drives on the ${pl > 0.5 ? "left" : "right"} · ${pct(sure)} sure`;
+    if (pl === null) {                      // plain heads have no driving-side output
+      $("sideDot").style.left = "50%";
+      $("sideText").className = "empty";
+      $("sideText").textContent = "This model has no driving-side output.";
+    } else {
+      $("sideDot").style.left = ((1 - pl) * 100) + "%";
+      const sure = Math.max(pl, 1 - pl);
+      $("sideText").className = "";
+      $("sideText").textContent = sure < 0.6 ? "Can't tell which side traffic drives on from this view."
+        : `Drives on the ${pl > 0.5 ? "left" : "right"} · ${pct(sure)} sure`;
+    }
 
     const plain = data.clip.plain_top;
     if (plain && plain.cell !== gs[0].cell) {

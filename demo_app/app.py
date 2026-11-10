@@ -91,8 +91,9 @@ def predict():
     if choice == "clip":
         if clip_model is None:
             return jsonify(error="The CLIP model isn't loaded on the server."), 400
-        out["clip"] = clip_model.predict(image, k=5)
-        plain = clip_model.predict(image, k=1, use_driving_side=False)["guesses"][0]
+        expected = request.form.get("expected", "1") != "0"   # rank by expected points unless the page sends expected=0
+        out["clip"] = clip_model.predict(image, k=5, expected=expected)
+        plain = clip_model.predict(image, k=1, use_driving_side=False, expected=expected)["guesses"][0]
         out["clip"]["plain_top"] = plain
     elif choice == "resnet":
         if resnet_model is None:

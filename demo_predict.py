@@ -119,22 +119,61 @@ class ResNetCountry:
         return [{"country": self.classes[j], "prob": float(q)} for q, j in zip(p, i)]
 
 
+DEFAULT_CLIP = "openai/clip-vit-base-patch32"
+
+
+class PlainHead(nn.Module):
+    """Cell classifier with no driving-side output (the notebook's MLPHead). The layer names
+    (trunk.0, cell_out) are the ones export_demo.py gives it."""
+
+    def __init__(self, n_cells, in_dim, hidden=1024, p=0.3):
+        super().__init__()
+        self.trunk = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(), nn.Dropout(p))
+        self.cell_out = nn.Linear(hidden, n_cells)
+
+    def forward(self, x):
+        return self.cell_out(self.trunk(x))
+
+
 class ClipCell:
-    """CLIP features -> geographic cell, adjusted by the mirror-based driving-side detector."""
+    """Any CLIP vision backbone -> trained head -> geographic cell. Mirror heads also get the
+    mirror-based driving-side adjustment; plain heads just rank the cells by probability.
+    The backbone name, feature size and photo transform all come from the exported file."""
 
     def __init__(self, path=MODEL_DIR / "clip_cell.pt", device="cpu"):
         from transformers import CLIPModel
         b = torch.load(path, map_location="cpu", weights_only=False)
-        if b.get("head_kind", "mirror") != "mirror":
-            raise ValueError(f"{path} has a '{b['head_kind']}' head; this demo runs only mirror heads. "
+        self.kind = b.get("head_kind", "mirror")
+        if self.kind not in ("mirror", "plain"):
+            raise ValueError(f"{path} has a '{self.kind}' head; this demo runs mirror and plain heads. "
                              "Load it on the GitHub Pages site instead (export_web.py --bundle).")
         self.b = b
         self.transform = make_transform(b["transform"])
-        clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        clip = CLIPModel.from_pretrained(b.get("clip_model", DEFAULT_CLIP))
         self.vision, self.proj = clip.vision_model, clip.visual_projection
-        self.head = MultiTaskHead(**b["head_kwargs"])
+        kw = b.get("head_kwargs")
+        if kw is None and self.kind == "plain":      # files exported before plain heads were supported
+            w = b["head"]
+            kw = {"n_cells": w["cell_out.weight"].shape[0], "in_dim": w["trunk.0.weight"].shape[1],
+                  "hidden": w["trunk.0.weight"].shape[0]}
+        self.head = (MultiTaskHead if self.kind == "mirror" else PlainHead)(**kw)
         self.head.load_state_dict(b["head"])
+        feat_dim = self.proj.out_features
+        if kw["in_dim"] != feat_dim:
+            raise ValueError(f"The head takes {kw['in_dim']}-d features but {b.get('clip_model', DEFAULT_CLIP)} "
+                             f"produces {feat_dim}-d. Re-export with the right --clip-model.")
         self.cell_left = np.asarray(b["cell_left"], dtype=np.float32)
+        # Expected-score decoding (the notebook's predict_expected): sim[i, j] = exp(-km(i, j) / 1492.7) is
+        # the share of the 5000 points for guessing cell j when the photo is in cell i. Skipped for very
+        # large heads, since the table is n x n.
+        self.sim = None
+        n = len(b["cell_lat"])
+        if n <= 4000:
+            lat, lon = np.radians(np.asarray(b["cell_lat"], dtype=np.float64)), np.radians(np.asarray(b["cell_lon"], dtype=np.float64))
+            a = (np.sin((lat[None, :] - lat[:, None]) / 2) ** 2
+                 + np.cos(lat)[:, None] * np.cos(lat)[None, :] * np.sin((lon[None, :] - lon[:, None]) / 2) ** 2)
+            km = 2 * 6371 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+            self.sim = np.nan_to_num(np.exp(-km / 1492.7)).astype(np.float32)
         self.device = device
         for m in (self.vision, self.proj, self.head):
             m.to(device).eval()
@@ -143,22 +182,29 @@ class ClipCell:
         return self.proj(self.vision(pixel_values=x).pooler_output)
 
     @torch.no_grad()
-    def predict(self, image, k=5, use_driving_side=True):
+    def predict(self, image, k=5, use_driving_side=True, expected=True):
+        """Top-k cells. expected=True ranks them by expected points (best first); False by probability.
+        Each guess still reports its probability."""
         x = self.transform(image.convert("RGB")).unsqueeze(0).to(self.device)
-        cell_logits, side_logit = self.head(self._features(x), self._features(torch.flip(x, dims=[3])))
+        if self.kind == "mirror":
+            cell_logits, side_logit = self.head(self._features(x), self._features(torch.flip(x, dims=[3])))
+            p_left = torch.sigmoid(side_logit).cpu().numpy()
+            w = self.b["fusion_weight"] if use_driving_side else 0.0
+        else:
+            cell_logits, p_left, w = self.head(self._features(x)), None, 0.0
         logp = cell_logits.log_softmax(1).cpu().numpy()
-        p_left = torch.sigmoid(side_logit).cpu().numpy()
-        w = self.b["fusion_weight"] if use_driving_side else 0.0
-        scores = fuse(logp, p_left, self.cell_left, w)[0]
+        scores = fuse(logp, p_left, self.cell_left, w)[0] if p_left is not None else logp[0]
         probs = np.exp(scores - scores.max())
         probs /= probs.sum()
-        top = np.argsort(-probs)[:k]
+        exp_pts = probs @ self.sim if expected and self.sim is not None else None   # expected share of 5000 points per cell
+        top = np.argsort(-(probs if exp_pts is None else exp_pts))[:k]
         b = self.b
         return {
-            "p_left_driving": float(p_left[0]),
+            "p_left_driving": None if p_left is None else float(p_left[0]),
             "guesses": [{"cell": b["cells"][j], "country": b["cell_country"][j],
                          "lat": b["cell_lat"][j], "lon": b["cell_lon"][j],
-                         "prob": float(probs[j])} for j in top],
+                         "prob": float(probs[j]),
+                         "expected": None if exp_pts is None else float(exp_pts[j])} for j in top],
         }
 
 

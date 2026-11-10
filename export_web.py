@@ -56,13 +56,15 @@ def build(src, name):
             index.append({"name": key, "shape": list(arr.shape), "offset": offset})
             offset += arr.size
     t = b["transform"]
+    size = b.get("image_size", 224)
     meta = {
         "name": name,
         "head_kind": kind,
-        "clip_model": "Xenova/clip-vit-base-patch32",
-        "resize": t["resize"],              # [224, 224] = squash whole photo; 224 = shorter side, then...
-        "center_crop": t.get("center_crop"),  # ...a 224 center crop (run 1)
-        "image_size": [224, 224],
+        "clip_model": b.get("web_model", "Xenova/clip-vit-base-patch32"),   # ONNX build the page loads
+        "clip_dim": state["trunk.0.weight"].shape[1],                       # features the head expects
+        "resize": t["resize"],              # [size, size] = squash whole photo; size = shorter side, then...
+        "center_crop": t.get("center_crop"),  # ...a size x size center crop (run 1)
+        "image_size": [size, size],
         "mean": t["mean"], "std": t["std"],
         "fusion_weight": b["fusion_weight"] if kind != "plain" else 0.0,
         "tensors": index,

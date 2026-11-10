@@ -6,8 +6,11 @@ import { CLIPVisionModelWithProjection, Tensor, env } from "https://cdn.jsdelivr
 
 env.allowLocalModels = false;   // CLIP comes from the Hugging Face CDN; heads come from ./model or a file
 
-const CLIP_MODEL = "Xenova/clip-vit-base-patch32", CLIP_DIM = 512;
-let meta = null, W = null, kind = null, builtIn = null, clip = null, clipDtype = null;
+// Which CLIP the page runs is decided by the loaded model file (meta.clip_model, meta.clip_dim,
+// meta.image_size). Files made before that was recorded are the original B/32 setup.
+const DEFAULT_CLIP = "Xenova/clip-vit-base-patch32", DEFAULT_DIM = 512, DEFAULT_SIZE = 224;
+let meta = null, W = null, kind = null, clip = null, clipDtype = null, clipName = null;
+const builtIns = new Map();   // folder -> { meta, W, kind }: the heads that ship with the site
 
 // ---------- heads ----------
 const fail = (msg) => { throw new Error(msg); };
@@ -26,12 +29,19 @@ function useHead(m, floats, fallbackName) {
       !m.cell_lon.every(v => Number.isFinite(v) && Math.abs(v) <= 180)) fail("The model file has cell coordinates off the map.");
   const left = Array.isArray(m.cell_left) && m.cell_left.length === n ? m.cell_left : new Array(n).fill(0.5);
   if (!left.every(v => Number.isFinite(v) && v >= 0 && v <= 1)) fail("The model file’s cell_left values must be between 0 and 1.");
-  if ((m.clip_model || CLIP_MODEL) !== CLIP_MODEL) fail(`This site runs ${CLIP_MODEL}; the file was made for ${m.clip_model}.`);
+  // The backbone is a Hugging Face repo with an ONNX build (the page downloads it from the Hub), so it
+  // has to look like "owner/name".
+  const clipModel = m.clip_model ?? DEFAULT_CLIP;
+  if (typeof clipModel !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(clipModel)) fail("The model file’s clip_model must be a Hugging Face name like owner/name.");
+  const dim = m.clip_dim ?? DEFAULT_DIM;
+  if (!isInt(dim) || dim > 4096) fail("The model file’s clip_dim must be a whole number up to 4096.");
+  const S = Array.isArray(m.image_size) ? m.image_size[0] : DEFAULT_SIZE;
+  if (!isInt(S) || S < 64 || S > 1024 || (Array.isArray(m.image_size) && m.image_size[1] !== S)) fail("The model file’s image_size must be a square size between 64 and 1024.");
   const ok3 = (a) => Array.isArray(a) && a.length === 3 && a.every(Number.isFinite);
   if (!ok3(m.mean) || !ok3(m.std) || !m.std.every(v => v > 0)) fail("The model file’s mean/std must be 3 numbers each.");
-  const squash = Array.isArray(m.resize) && m.resize.length === 2 && m.resize[0] === 224 && m.resize[1] === 224 && !m.center_crop;
-  const crop = isInt(m.resize) && m.resize >= 224 && m.resize <= 1024 && m.center_crop === 224;
-  if (!squash && !crop) fail("The model file’s resize must be [224, 224] (whole photo) or a shorter side of 224+ with a 224 center crop.");
+  const squash = Array.isArray(m.resize) && m.resize.length === 2 && m.resize[0] === S && m.resize[1] === S && !m.center_crop;
+  const crop = isInt(m.resize) && m.resize >= S && m.resize <= 1024 && m.center_crop === S;
+  if (!squash && !crop) fail(`The model file’s resize must be [${S}, ${S}] (whole photo) or a shorter side of ${S}+ with a ${S} center crop.`);
   const fw = m.fusion_weight ?? 0;
   if (!Number.isFinite(fw) || fw < 0 || fw > 20) fail("The model file’s fusion_weight must be between 0 and 20.");
 
@@ -50,12 +60,12 @@ function useHead(m, floats, fallbackName) {
     if (s.length !== want.length || s.some((v, i) => v !== want[i])) fail(`${name} should be [${want}] but is [${s}].`);
   };
   const hidden = w["trunk.0.weight"]?.shape[0] || fail("The model file is missing trunk.0.weight.");
-  shape("trunk.0.weight", [hidden, CLIP_DIM]); shape("trunk.0.bias", [hidden]);
+  shape("trunk.0.weight", [hidden, dim]); shape("trunk.0.bias", [hidden]);
   shape("cell_out.weight", [n, hidden]); shape("cell_out.bias", [n]);
   let k = "plain";
   if (w["side_net.0.weight"]) {
     const s = w["side_net.0.weight"].shape[0];
-    shape("side_net.0.weight", [s, CLIP_DIM]); shape("side_net.0.bias", [s]);
+    shape("side_net.0.weight", [s, dim]); shape("side_net.0.bias", [s]);
     shape("side_net.3.weight", [1, s]); shape("side_net.3.bias", [1]);
     k = "mirror";
   } else if (w["side_out.weight"]) {
@@ -63,31 +73,50 @@ function useHead(m, floats, fallbackName) {
     k = "shared";
   }
   const name = (typeof m.name === "string" && m.name.trim() ? m.name.trim() : fallbackName).slice(0, 80);
-  meta = { ...m, name, cell_left: left, fusion_weight: k === "plain" ? 0 : fw, head_kind: k, image_size: [224, 224] };
+  meta = { ...m, name, cell_left: left, fusion_weight: k === "plain" ? 0 : fw, head_kind: k,
+           clip_model: clipModel, clip_dim: dim, image_size: [S, S] };
   W = w; kind = k;
   return meta;
 }
 
 export function activeModel() { return meta; }
 
-// The model that ships with the site (docs/model).
-export async function loadHead(base = "model") {
-  if (builtIn) return builtIn.meta;
+// The CLIP backbone the active head needs (the page reloads CLIP when this changes).
+export function wantedClip() { return meta?.clip_model ?? DEFAULT_CLIP; }
+
+// The models that ship with the site: the default is docs/model; others live in their own folders
+// (for example docs/model/run12), each holding meta.json and head.bin (export_web.py --out-dir).
+async function fetchHead(base) {
   const [m, buf] = await Promise.all([
-    fetch(`${base}/meta.json`).then(r => r.ok ? r.json() : fail("Couldn't load model/meta.json")),
-    fetch(`${base}/head.bin`).then(r => r.ok ? r.arrayBuffer() : fail("Couldn't load model/head.bin")),
+    fetch(`${base}/meta.json`).then(r => r.ok ? r.json() : fail(`Couldn't load ${base}/meta.json`)),
+    fetch(`${base}/head.bin`).then(r => r.ok ? r.arrayBuffer() : fail(`Couldn't load ${base}/head.bin`)),
   ]);
-  if (buf.byteLength % 4) fail("model/head.bin is damaged.");
-  useHead(m, new Float32Array(buf), "Built-in model");
-  builtIn = { meta, W, kind };
+  if (buf.byteLength % 4) fail(`${base}/head.bin is damaged.`);
+  useHead(m, new Float32Array(buf), "Built-in model");   // validates first; only then becomes the active head
+  meta.base = base;
+  builtIns.set(base, { meta, W, kind });
   return meta;
 }
 
-export function useBuiltIn() {
-  if (!builtIn) fail("The built-in model hasn't loaded.");
-  ({ meta, W, kind } = builtIn);
+// Loads a built-in head the first time; afterwards returns it without switching the active head.
+export async function loadHead(base = "model") {
+  return builtIns.has(base) ? builtIns.get(base).meta : fetchHead(base);
+}
+
+// Makes the built-in head in folder `base` the active one (loading it first if needed).
+export async function selectBuiltIn(base) {
+  if (!builtIns.has(base)) return fetchHead(base);
+  ({ meta, W, kind } = builtIns.get(base));
   return meta;
 }
+
+export function useBuiltIn(base = "model") {
+  if (!builtIns.has(base)) fail("The built-in model hasn't loaded.");
+  ({ meta, W, kind } = builtIns.get(base));
+  return meta;
+}
+
+export function isBuiltIn(m) { return [...builtIns.values()].some(b => b.meta === m); }
 
 // A .geomodel file: "GEOMODEL1\n", uint32 metadata length (little-endian), metadata JSON,
 // then float32 weights (export_web.py --bundle).
@@ -109,20 +138,23 @@ export async function loadBundle(file) {
 
 // dtype "fp16" (~176 MB) and "fp32" (~352 MB) both match the Python model's guesses; the 8-bit
 // "q8" file (~89 MB) changed the top guess on half of our test photos, so the page doesn't offer it.
+// The file sizes above are for B/32; larger backbones are proportionally bigger downloads.
 export async function loadClip(dtype = "fp16", onProgress = () => {}) {
-  if (clip && clipDtype === dtype) return;
-  clip = await CLIPVisionModelWithProjection.from_pretrained(CLIP_MODEL, {
+  const name = wantedClip();
+  if (clip && clipDtype === dtype && clipName === name) return;
+  clip = null; clipName = null;           // drop the old backbone before loading another
+  clip = await CLIPVisionModelWithProjection.from_pretrained(name, {
     dtype, device: "wasm",
     progress_callback: (p) => { if (p.status === "progress") onProgress(p); },
   });
-  clipDtype = dtype;
+  clipDtype = dtype; clipName = name;
 }
 
 // One throwaway run on a blank image: the model's first run is slow because it sets itself up,
 // so doing it in the background makes the visitor's first real guess fast.
 export async function warmUp() {
   const c = document.createElement("canvas");
-  c.width = 224; c.height = 224;
+  c.width = c.height = meta?.image_size?.[0] ?? DEFAULT_SIZE;
   await predict(c);
 }
 
@@ -200,7 +232,7 @@ function preprocess(source, crop, withMirror) {
   ctx.drawImage(source, x0, y0, cw, ch, 0, 0, cw, ch);          // 1:1 copy, no scaling
   const px = ctx.getImageData(0, 0, cw, ch).data;
 
-  const S = 224;
+  const S = meta.image_size[0];
   let rgb;
   if (Array.isArray(meta.resize)) {
     rgb = pilResize(px, cw, ch, S, S);
@@ -241,21 +273,67 @@ function linear(x, name) {          // y = W x + b, W stored [out, in] like torc
 const relu = (x) => x.map(v => (v > 0 ? v : 0));
 const sideNet = (f) => linear(relu(linear(f, "side_net.0")), "side_net.3")[0];
 
-function rank(scores, k) {
+// ---------- expected-score decoding ----------
+// The most probable cell isn't always the best guess: when the probability is spread over cells that
+// are close together, a cell in the middle of them earns more points on average. S[i][j] =
+// exp(-km(i, j) / 1492.7) is the share of the 5000 points you'd get for guessing cell j when the photo
+// is really in cell i (the same formula as the Score box), so the best guess maximises
+//   expected(j) = sum_i p_i * S[i][j]
+// This is the notebook's predict_expected.
+const SCORE_KM = 1492.7, MAX_SIM_CELLS = 4000;   // the table is n x n floats, so very large heads skip this
+const simCache = new WeakMap();                   // head metadata -> its n x n table, built once
+function similarity() {
+  const n = meta.cells.length;
+  if (n > MAX_SIM_CELLS) return null;
+  let S = simCache.get(meta);
+  if (S) return S;
+  S = new Float32Array(n * n);
+  const rad = Math.PI / 180, lat = meta.cell_lat.map(v => v * rad), lon = meta.cell_lon.map(v => v * rad);
+  const cosLat = lat.map(Math.cos);
+  for (let i = 0; i < n; i++) {
+    for (let j = i; j < n; j++) {
+      const a = Math.sin((lat[j] - lat[i]) / 2) ** 2 + cosLat[i] * cosLat[j] * Math.sin((lon[j] - lon[i]) / 2) ** 2;
+      S[i * n + j] = S[j * n + i] = Math.exp(-(2 * 6371 * Math.asin(Math.min(1, Math.sqrt(a)))) / SCORE_KM);
+    }
+  }
+  simCache.set(meta, S);
+  return S;
+}
+
+// Expected share of the 5000 points for guessing each cell, or null if the table is too big.
+function expectedScores(probs) {
+  const S = similarity();
+  if (!S) return null;
+  const n = probs.length, E = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const p = probs[i];
+    if (p < 1e-7) continue;                       // negligible probability can't change the ranking
+    const row = i * n;
+    for (let j = 0; j < n; j++) E[j] += p * S[row + j];
+  }
+  return E;
+}
+
+// Top-k cells. By probability, or (expected = true) by expected points; `prob` is always the probability.
+function rank(scores, k, expected = false) {
   const m = Math.max(...scores);
   const e = scores.map(s => Math.exp(s - m));
   const z = e.reduce((a, b) => a + b, 0);
   const probs = e.map(v => v / z);
-  const order = [...probs.keys()].sort((a, b) => probs[b] - probs[a]).slice(0, k);
+  const E = expected ? expectedScores(probs) : null;
+  const key = E || probs;
+  const order = [...key.keys()].sort((a, b) => key[b] - key[a]).slice(0, k);
   return order.map(j => ({
     cell: meta.cells[j], country: meta.cell_country[j],
     lat: meta.cell_lat[j], lon: meta.cell_lon[j], prob: probs[j],
+    expected: E ? E[j] : null,                    // share of 5000 points, when ranking by expected score
   }));
 }
 
 const sigmoid = (z) => 1 / (1 + Math.exp(-z));
 
-export async function predict(source, { crop = null, k = 5 } = {}) {
+export async function predict(source, { crop = null, k = 5, expected = true } = {}) {
+  if (!clip || clipName !== wantedClip()) fail("CLIP for this model isn't loaded yet.");
   const { tensor, size } = preprocess(source, crop, kind === "mirror");
   const { image_embeds } = await clip({ pixel_values: tensor });
   const emb = image_embeds.data, d = image_embeds.dims[1];
@@ -281,8 +359,8 @@ export async function predict(source, { crop = null, k = 5 } = {}) {
   }
   return {
     size, p_left_driving: pLeft,
-    guesses: rank(fused, k),
-    plain_top: rank(logp, 1)[0],
+    guesses: rank(fused, k, expected),
+    plain_top: rank(logp, 1, expected)[0],
     embedding: f,
   };
 }

@@ -97,8 +97,8 @@
   .how a { color: var(--accent); }
   .progress { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; margin-top: 6px; }
   .progress i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
-  #resnetLabel { font: 400 .8rem var(--mono); color: var(--muted); cursor: pointer; }
-  #resnetLabel input { vertical-align: middle; margin: 0 4px 0 0; }
+  #resnetLabel, #expectedLabel { font: 400 .8rem var(--mono); color: var(--muted); cursor: pointer; }
+  #resnetLabel input, #expectedLabel input { vertical-align: middle; margin: 0 4px 0 0; }
   #resnetCard h2::after { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #2563eb; margin-left: 8px; }
 </style>
 </head>
@@ -113,6 +113,7 @@
       <div><span id="models">Loading model…</span><label for="dtype" style="margin-left:10px">CLIP size</label><select id="dtype"><option value="fp16">standard, 176 MB</option><option value="fp32">full precision, 352 MB</option></select></div>
       <div class="modelrow">
         <span>Model: <b id="modelName">built-in</b> <span id="modelInfo"></span></span>
+        <select id="builtinSel" hidden title="Switch between the models that ship with the site"></select>
         <button class="small" id="loadModel" title="Load a .geomodel file made with export_web.py --bundle">Load a model…</button>
         <button class="small" id="useBuiltIn" hidden>Use built-in</button>
         <input type="file" id="modelFile" accept=".geomodel" hidden>
@@ -121,6 +122,7 @@
         <button class="small" id="loadResnet" title="Load a .resnetmodel file made with pack_resnet_bundle.py">Load ResNet…</button>
         <input type="file" id="resnetFile" accept=".resnetmodel" hidden>
         <label id="resnetLabel" hidden title="Also guess the country with a ResNet-101 model."><input type="checkbox" id="useResnet"><span id="resnetText"></span></label>
+        <label id="expectedLabel" title="Rank the guesses by the points they earn on average, not just by how likely the cell is. Untick to rank by probability."><input type="checkbox" id="useExpected" checked>Rank by expected score</label>
       </div>
     </div>
   </header>
@@ -232,8 +234,8 @@ map.on("click", (e) => {
 let ready = null;
 function setStatus(text, error = false) { $("status").textContent = text; $("status").className = "status" + (error ? " error" : ""); }
 function ensureModel() {
-  const dtype = $("dtype").value;
-  if (ready && ready.dtype === dtype) return ready.promise;
+  const dtype = $("dtype").value, name = geo.wantedClip();   // name: the CLIP backbone the active head needs
+  if (ready && ready.dtype === dtype && ready.name === name) return ready.promise;
   const files = {};
   $("progress").hidden = false;
   const promise = geo.loadHead().then(() => geo.loadClip(dtype, (p) => {
@@ -255,7 +257,7 @@ function ensureModel() {
     $("models").textContent = "Model didn't load";
     throw err;
   });
-  ready = { dtype, promise };
+  ready = { dtype, name, promise };
   return promise;
 }
 $("dtype").addEventListener("change", () => { $("models").textContent = "Loading model…"; ensureModel().catch(e => setStatus(e.message, true)); });
@@ -266,7 +268,7 @@ const saveData = navigator.connection?.saveData === true;
 geo.loadHead()
   .then(m => {
     showModel(m);
-    if (saveData) { $("models").textContent = `${m.cells.length.toLocaleString()} cells · loads CLIP (176 MB) on first guess`; return; }
+    if (saveData) { $("models").textContent = `${m.cells.length.toLocaleString()} cells · loads CLIP on first guess`; return; }
     $("models").textContent = "Loading CLIP…";
     return ensureModel().catch(e => setStatus(`Couldn't load CLIP: ${e.message}`, true));
   })
@@ -275,20 +277,25 @@ geo.loadHead()
 // ---------- switching models ----------
 // A .geomodel file (export_web.py --bundle) replaces the built-in head. It's read in the
 // browser and never uploaded anywhere; reloading the page goes back to the built-in model.
-let builtInMeta = null;
 const KIND_TEXT = { mirror: "mirror driving side", shared: "run-1 driving side", plain: "no driving side" };
 function showModel(m) {
-  if (!builtInMeta) builtInMeta = m;
   $("modelName").textContent = m.name;
+  if (geo.isBuiltIn(m) && m.base && [...$("builtinSel").options].some(o => o.value === m.base)) $("builtinSel").value = m.base;
   $("modelInfo").textContent = `(${m.cells.length.toLocaleString()} cells, ${KIND_TEXT[m.head_kind]}${
-    m.head_kind !== "plain" ? `, weight ${m.fusion_weight}` : ""}${m.center_crop ? ", center crop" : ""})`;
-  $("useBuiltIn").hidden = m === builtInMeta;
+    m.head_kind !== "plain" ? `, weight ${m.fusion_weight}` : ""}${m.center_crop ? ", center crop" : ""}, ${m.clip_model.split("/").pop()})`;
+  $("useBuiltIn").hidden = geo.isBuiltIn(m);          // shown only while a file the visitor loaded is active
 }
 function afterModelChange(m, message) {
   showModel(m);
   setStatus(message);
-  if (bitmap && !$("go").disabled) $("go").click();   // re-guess the current screenshot with the new model
-  else resetResults();
+  const rerun = () => {
+    if (bitmap && !$("go").disabled) $("go").click();   // re-guess the current screenshot with the new model
+    else resetResults();
+  };
+  if (!ready || ready.name !== geo.wantedClip()) {      // the new head was trained on a different CLIP
+    $("models").textContent = "Loading model…";
+    ensureModel().then(rerun).catch(e => setStatus(`Couldn't load CLIP: ${e.message}`, true));
+  } else rerun();
 }
 function resetResults() {
   layer.clearLayers(); topGuess = null;
@@ -309,7 +316,26 @@ $("modelFile").addEventListener("change", async (e) => {
     setStatus(`Couldn’t load that model: ${err.message}`, true);
   }
 });
-$("useBuiltIn").addEventListener("click", () => afterModelChange(geo.useBuiltIn(), "Back to the built-in model."));
+$("useBuiltIn").addEventListener("click", () => afterModelChange(geo.useBuiltIn($("builtinSel").value || "model"), "Back to the built-in model."));
+$("useExpected").addEventListener("change", () => { if (bitmap && !$("go").disabled) $("go").click(); });   // re-rank the current screenshot
+
+// Built-in models: docs/model/models.json lists the heads that ship with the site, for example
+//   [{"name": "Run 2: mirror driving side", "dir": "model"}, {"name": "Run 12: plain", "dir": "model/run12"}]
+// With two or more, a drop-down switches between them with no upload. The first one is the default.
+// Without the file, the site has just the one built-in model, as before.
+fetch("model/models.json").then(r => r.ok ? r.json() : null).then(list => {
+  if (!Array.isArray(list) || list.length < 2 || !list.every(e => typeof e?.name === "string" && typeof e?.dir === "string")) return;
+  const sel = $("builtinSel");
+  sel.replaceChildren(...list.map(e => Object.assign(document.createElement("option"), { value: e.dir, textContent: e.name })));
+  sel.value = geo.activeModel()?.base ?? list[0].dir;
+  sel.hidden = false;
+  sel.addEventListener("change", async () => {
+    try {
+      setStatus("Loading the model…");
+      afterModelChange(await geo.selectBuiltIn(sel.value), `Switched to “${sel.selectedOptions[0].textContent}”.`);
+    } catch (err) { setStatus(`Couldn’t load that model: ${err.message}`, true); }
+  });
+}).catch(() => {});
 
 // ---------- input ----------
 let imageFile = null, bitmap = null, crop = null;
@@ -375,7 +401,8 @@ function renderList(el, items) {
     name.textContent = `${flag(g.country)} ${regionName(g.country)}`.trim();
     const p = document.createElement("span"); p.className = "pct"; p.textContent = pct(g.prob);
     const c = document.createElement("span"); c.className = "coords";
-    c.textContent = `${g.cell !== undefined ? `cell ${g.cell}` : "country centre"} · ${fmtCoord(g.lat, g.lon)}`;
+    c.textContent = `${g.cell !== undefined ? `cell ${g.cell}` : "country centre"} · ${fmtCoord(g.lat, g.lon)}${
+      g.expected != null ? ` · ~${Math.round(5000 * g.expected).toLocaleString()} pts expected` : ""}`;
     const bar = document.createElement("span"); bar.className = "bar";
     const fill = document.createElement("i"); fill.style.width = Math.max(g.prob * 100, 1) + "%"; bar.append(fill);
     li.append(rank, name, p, c, bar);
@@ -390,13 +417,13 @@ $("go").addEventListener("click", async () => {
     setStatus("Loading the model…");
     await ensureModel();
     setStatus("Thinking…");
-    const out = await geo.predict(bitmap, { crop });
+    const out = await geo.predict(bitmap, { crop, expected: $("useExpected").checked });
     show(out);
     let resnetErr = null;
     if ($("useResnet").checked) resnetErr = await runResnet();
     else resetResnet();
     const m = geo.activeModel();
-    setStatus(`Guessed from a ${out.size[0]}×${out.size[1]} image${crop ? " (cropped)" : ""}${m === builtInMeta ? "" : ` with “${m.name}”`}.`
+    setStatus(`Guessed from a ${out.size[0]}×${out.size[1]} image${crop ? " (cropped)" : ""}${geo.isBuiltIn(m) ? "" : ` with “${m.name}”`}.`
       + (resnetErr ? ` ResNet didn't run: ${resnetErr}` : ""), !!resnetErr);
   } catch (err) {
     setStatus(`Something went wrong: ${err.message}`, true);
