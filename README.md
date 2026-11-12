@@ -6,6 +6,8 @@ Everything for CLIP is in one notebook, clip_model.ipynb. It loads the image lis
 
 Similarly, it exists for ResNET under the resnet_model.ipynb.
 
+Please note that the demo app and the exploration of the CLIP model w/ other features exists on the Additional_Features branch.
+
 To install what it needs, use Python 3.11 and run:
 
 pip install -r requirements.txt
@@ -14,7 +16,7 @@ A GPU is strongly recommended. The first run downloads CLIP from Hugging Face, s
 
 The data is the OpenStreetView-5M dataset, about 5.1 million street-level photos from Mapillary (https://huggingface.co/datasets/osv5m/osv5m). We used the copy provided for the course. The data was extracted using import.ipynb. Used the same code, but changed the word 'test' to 'train' when we needed it.
 
-To run it, open main.ipynb and run all the cells, or run this in a terminal if in a SLURM cluster, sbatch train.sbatch.
+To run it, open <model>.ipynb and run all the cells, or run this in a terminal if in a SLURM cluster, sbatch train.sbatch (Edit this to change the file name at the end to the desired model).
 
 For a quick check that takes a few minutes, set K = 2, n_samples = 20000 and num_epochs = 5 in the first cell. The full run uses K = None, n_samples = 1000000 and num_epochs = 20 and takes hours on a GPU. 
 
