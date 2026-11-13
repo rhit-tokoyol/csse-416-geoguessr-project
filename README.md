@@ -26,3 +26,5 @@ For running the ResNet101 model, open resnet_model.ipynb and run all cells (real
 
 Note for the sbatch files:
 You may have to adjust file locations to fit your system. (such as mkdir into local files systems for output results)
+
+If you are looking for web server code, it is in [additional-features] branch.
