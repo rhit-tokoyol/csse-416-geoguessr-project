@@ -28,3 +28,5 @@ Note for the sbatch files:
 You may have to adjust file locations to fit your system. (such as mkdir into local files systems for output results)
 
 If you are looking for web server code, it is in [additional-features] branch.
+
+AI was primarily involved w/ debugging code, and helped generate the code for loading in the 4M+ images and linking them to the dataset. It also helped w/ finding code online to work with CLIP and for implementing expected geoscore to maximize it instead of probability.
